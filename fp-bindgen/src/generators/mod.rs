@@ -68,6 +68,10 @@ pub struct RustPluginConfig {
 
     /// The license of the generated crate.
     pub license: Option<RustPluginConfigValue>,
+
+    /// Whether the crate is marked as published or not (note: this should
+    /// the string value "true" or "false")
+    pub publish: Option<RustPluginConfigValue>,
 }
 
 impl RustPluginConfig {
@@ -81,6 +85,7 @@ impl RustPluginConfig {
                 description: None,
                 readme: None,
                 license: None,
+                publish: None,
             },
         }
     }
@@ -92,6 +97,7 @@ pub enum RustPluginConfigValue {
     String(String),
     Vec(Vec<String>),
     Workspace,
+    Bool(bool),
 }
 
 impl From<&str> for RustPluginConfigValue {
@@ -115,6 +121,12 @@ impl From<Vec<&str>> for RustPluginConfigValue {
 impl From<Vec<String>> for RustPluginConfigValue {
     fn from(value: Vec<String>) -> Self {
         Self::Vec(value)
+    }
+}
+
+impl From<bool> for RustPluginConfigValue {
+    fn from(value: bool) -> Self {
+        Self::Bool(value)
     }
 }
 
@@ -178,6 +190,11 @@ impl RustPluginConfigBuilder {
         self
     }
 
+    pub fn publish(mut self, value: bool) -> Self {
+        self.config.publish = Some(value.into());
+        self
+    }
+
     pub fn dependency(mut self, name: impl Into<String>, dependency: CargoDependency) -> Self {
         self.config.dependencies.insert(name.into(), dependency);
         self
@@ -235,7 +252,7 @@ impl TsRuntimeConfig {
 
     /// Sets the `msgpack_module` setting.
     pub fn with_msgpack_module(mut self, msgpack_module: &str) -> Self {
-        self.msgpack_module = msgpack_module.to_owned();
+        msgpack_module.clone_into(&mut self.msgpack_module);
         self
     }
 

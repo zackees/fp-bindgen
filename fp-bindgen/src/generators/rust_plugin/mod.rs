@@ -102,7 +102,7 @@ fn generate_cargo_file(
         format!(
             "[package]
 {}{}{}edition = \"2018\"
-{}{}{}
+{}{}{}{}
 [dependencies]
 {}
 ",
@@ -112,6 +112,7 @@ fn generate_cargo_file(
             format_cargo_key("description", config.description),
             format_cargo_key("readme", config.readme),
             format_cargo_key("license", config.license),
+            format_cargo_key("publish", config.publish),
             dependencies
                 .iter()
                 .map(|(name, value)| format!("{name} = {value}"))
@@ -591,6 +592,7 @@ fn format_cargo_key(key: &str, value: Option<RustPluginConfigValue>) -> String {
                 inline.insert("workspace", true.into());
                 toml_edit::value(inline)
             }
+            RustPluginConfigValue::Bool(value) => toml_edit::value(value),
         };
 
         let mut doc = toml_edit::Document::new();
