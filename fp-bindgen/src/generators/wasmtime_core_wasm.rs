@@ -440,12 +440,14 @@ fn render_host_helpers(import_functions: &FunctionList, export_functions: &Funct
             }
         }
     }
-    ["bool", "i8", "i16", "i32", "u8", "u16", "u32", "i64", "u64", "f32", "f64"]
-        .iter()
-        .filter(|semantic| used.contains(*semantic))
-        .map(|semantic| host_helper_source(semantic))
-        .collect::<Vec<_>>()
-        .join("\n")
+    [
+        "bool", "i8", "i16", "i32", "u8", "u16", "u32", "i64", "u64", "f32", "f64",
+    ]
+    .iter()
+    .filter(|semantic| used.contains(*semantic))
+    .map(|semantic| host_helper_source(semantic))
+    .collect::<Vec<_>>()
+    .join("\n")
 }
 
 fn host_helper_source(semantic: &str) -> &'static str {
@@ -821,8 +823,8 @@ results = [{ semantic = "f64", abi = "f64" }]
             .contains("match value { 0 => Ok(false), 1 => Ok(true)"));
         let mut narrow_imports = FunctionList::new();
         narrow_imports.add_function("fn narrow(value: u8) -> u16;");
-        let narrow = render_bindings(&narrow_imports, &FunctionList::new(), &TypeMap::new())
-            .unwrap();
+        let narrow =
+            render_bindings(&narrow_imports, &FunctionList::new(), &TypeMap::new()).unwrap();
         assert!(narrow
             .host_linker
             .contains("u16_from_i32(value: i32) -> wasmtime::Result<u16>"));
