@@ -830,11 +830,29 @@ results = [{ semantic = "f64", abi = "f64" }]
 
     #[test]
     fn target_feature_is_dependency_free_and_default_isolated() {
-        let cargo = include_str!("../../Cargo.toml");
-        assert!(cargo.contains("wasmtime-core-wasm = []"));
-        assert!(!cargo.contains("wasmtime ="));
-        assert!(!cargo.contains("wasmer ="));
-        assert!(!cargo.contains("tokio ="));
-        assert!(!cargo.contains("fp-bindgen-support"));
+        let cargo: toml::Value = include_str!("../../Cargo.toml").parse().unwrap();
+        let features = cargo["features"].as_table().unwrap();
+        let dependencies = cargo["dependencies"].as_table().unwrap();
+
+        assert!(features["wasmtime-core-wasm"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let integration = features["wasmtime45-integration"].as_array().unwrap();
+        assert_eq!(integration.len(), 2);
+        assert_eq!(integration[0].as_str(), Some("wasmtime-core-wasm"));
+        assert_eq!(integration[1].as_str(), Some("dep:wasmtime"));
+        assert!(dependencies["wasmtime"]["optional"].as_bool().unwrap());
+        assert_eq!(dependencies["wasmtime"]["version"].as_str(), Some("45"));
+        assert!(!features["default"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|feature| feature
+                .as_str()
+                .is_some_and(|feature| feature.contains("wasmtime"))));
+        assert!(!dependencies.contains_key("wasmer"));
+        assert!(!dependencies.contains_key("tokio"));
+        assert!(!dependencies.contains_key("fp-bindgen-support"));
     }
 }
