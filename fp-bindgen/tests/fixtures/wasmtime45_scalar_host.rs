@@ -29,16 +29,18 @@ pub(crate) trait KernalApiV1Imports {
     fn checked(&mut self, flag: bool, tiny: u8, total: u64) -> wasmtime::Result<bool>;
 }
 
-pub(crate) fn link_kernal_api_v1<T>(
-    linker: &mut wasmtime::Linker<T>,
-) -> wasmtime::Result<()>
+pub(crate) fn link_kernal_api_v1<T>(linker: &mut wasmtime::Linker<T>) -> wasmtime::Result<()>
 where
     T: KernalApiV1Imports + Send + 'static,
 {
     linker.func_wrap(
         "kernal-api:v1",
         "checked",
-        |mut caller: wasmtime::Caller<'_, T>, flag: i32, tiny: i32, total: i64| -> wasmtime::Result<i32> {
+        |mut caller: wasmtime::Caller<'_, T>,
+         flag: i32,
+         tiny: i32,
+         total: i64|
+         -> wasmtime::Result<i32> {
             let flag = bool_from_i32(flag)?;
             let tiny = u8_from_i32(tiny)?;
             let total = u64_from_i64(total)?;

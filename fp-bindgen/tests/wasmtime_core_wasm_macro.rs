@@ -37,7 +37,9 @@ mod rejected {
     fp_export! {}
 
     #[test]
-    #[should_panic(expected = "fp-bindgen binding generation failed: import function `host_bulk` has unsupported argument `value` type `String`")]
+    #[should_panic(
+        expected = "fp-bindgen binding generation failed: import function `host_bulk` has unsupported argument `value` type `String`"
+    )]
     fn canonical_macro_reports_rejected_declaration() {
         fp_bindgen!(BindingConfig {
             bindings_type: BindingsType::RustWasmtimeCoreWasm,
