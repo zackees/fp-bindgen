@@ -184,6 +184,7 @@ Currently, we support the following binding types:
   user-defined values rather than using the legacy allocation or serialization protocol. Enable
   the dependency-free `wasmtime-core-wasm` feature; use
   `try_generate_wasmtime_core_wasm_bindings` when output errors must be handled explicitly.
+  The separate `wasmtime45-integration` feature only compile-checks the emitted host template.
 - `BindingsType::TsRuntimeWithExtendedConfig`: Generates bindings for a TypeScript runtime.
 
 Note that some binding types take an additional config argument.

@@ -443,7 +443,7 @@ fn render_host_linker(import_functions: &FunctionList, export_functions: &Functi
          fn f64_to_f64(value: f64) -> f64 {{ value }}\n\n\
          pub(crate) trait KernalApiV1Imports {{\n{trait_methods}\n}}\n\n\
          pub(crate) fn link_kernal_api_v1<T>(linker: &mut wasmtime::Linker<T>) -> wasmtime::Result<()>\n\
-         where T: KernalApiV1Imports + Send,\n{{\n{registrations}\n    Ok(())\n}}\n\n\
+         where T: KernalApiV1Imports + Send + 'static,\n{{\n{registrations}\n    Ok(())\n}}\n\n\
          {invocations}\n"
     )
 }
@@ -724,6 +724,9 @@ mod tests {
             .guest_source
             .contains("#[no_mangle]\npub extern \"C\" fn guest_value(value: i64) -> f64"));
         assert!(rendered.host_linker.contains("fn zeta(&mut self, flag: bool, count: i32, total: u64, ratio: f32, precise: f64) -> wasmtime::Result<()>"));
+        assert!(rendered
+            .host_linker
+            .contains("T: KernalApiV1Imports + Send + 'static"));
         assert!(rendered.host_linker.contains("invoke_guest_value"));
         for legacy in ["FatPtr", "MessagePack", "Wasmer", "Tokio", "rmp"] {
             assert!(!rendered.guest_source.contains(legacy));

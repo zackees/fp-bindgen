@@ -199,12 +199,15 @@ pub fn fp_bindgen(args: TokenStream) -> TokenStream {
         let mut types = import_types;
         types.append(&mut export_types);
 
-        fp_bindgen::generate_bindings(
+        match fp_bindgen::generate_bindings(
             import_functions,
             export_functions,
             types,
             #args
-        );
+        ) {
+            Ok(()) => (),
+            Err(error) => panic!("fp-bindgen binding generation failed: {error}"),
+        };
     };
     replacement.into()
 }
