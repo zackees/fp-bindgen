@@ -423,7 +423,9 @@ fn render_host_linker(import_functions: &FunctionList, export_functions: &Functi
          {helpers}\n\n\
          pub(crate) trait KernalApiV1Imports {{\n{trait_methods}\n}}\n\n\
          pub(crate) fn link_kernal_api_v1<T>(linker: &mut wasmtime::Linker<T>) -> wasmtime::Result<()>\n\
-         where T: KernalApiV1Imports + Send + 'static,\n{{\n{registrations}\n    Ok(())\n}}\n\n\
+         where\n\
+         \u{20}   T: KernalApiV1Imports + Send + 'static,\n\
+         {{\n{registrations}\n    Ok(())\n}}\n\n\
          {invocations}\n"
     )
 }
@@ -452,17 +454,17 @@ fn render_host_helpers(import_functions: &FunctionList, export_functions: &Funct
 
 fn host_helper_source(semantic: &str) -> &'static str {
     match semantic {
-        "bool" => "fn bool_from_i32(value: i32) -> wasmtime::Result<bool> { match value { 0 => Ok(false), 1 => Ok(true), value => Err(wasmtime::Error::msg(format!(\"invalid bool ABI value: {value}\"))) } }\nfn bool_to_i32(value: bool) -> i32 { i32::from(value) }",
-        "i8" => "fn i8_from_i32(value: i32) -> wasmtime::Result<i8> { value.try_into().map_err(|_| wasmtime::Error::msg(format!(\"invalid i8 ABI value: {value}\"))) }\nfn i8_to_i32(value: i8) -> i32 { value as i32 }",
-        "i16" => "fn i16_from_i32(value: i32) -> wasmtime::Result<i16> { value.try_into().map_err(|_| wasmtime::Error::msg(format!(\"invalid i16 ABI value: {value}\"))) }\nfn i16_to_i32(value: i16) -> i32 { value as i32 }",
-        "i32" => "fn i32_from_i32(value: i32) -> wasmtime::Result<i32> { Ok(value) }\nfn i32_to_i32(value: i32) -> i32 { value }",
-        "u8" => "fn u8_from_i32(value: i32) -> wasmtime::Result<u8> { value.try_into().map_err(|_| wasmtime::Error::msg(format!(\"invalid u8 ABI value: {value}\"))) }\nfn u8_to_i32(value: u8) -> i32 { value as i32 }",
-        "u16" => "fn u16_from_i32(value: i32) -> wasmtime::Result<u16> { value.try_into().map_err(|_| wasmtime::Error::msg(format!(\"invalid u16 ABI value: {value}\"))) }\nfn u16_to_i32(value: u16) -> i32 { value as i32 }",
-        "u32" => "fn u32_from_i32(value: i32) -> wasmtime::Result<u32> { Ok(value as u32) }\nfn u32_to_i32(value: u32) -> i32 { value as i32 }",
-        "i64" => "fn i64_from_i64(value: i64) -> wasmtime::Result<i64> { Ok(value) }\nfn i64_to_i64(value: i64) -> i64 { value }",
-        "u64" => "fn u64_from_i64(value: i64) -> wasmtime::Result<u64> { Ok(value as u64) }\nfn u64_to_i64(value: u64) -> i64 { value as i64 }",
-        "f32" => "fn f32_from_f32(value: f32) -> wasmtime::Result<f32> { Ok(value) }\nfn f32_to_f32(value: f32) -> f32 { value }",
-        "f64" => "fn f64_from_f64(value: f64) -> wasmtime::Result<f64> { Ok(value) }\nfn f64_to_f64(value: f64) -> f64 { value }",
+        "bool" => "fn bool_from_i32(value: i32) -> wasmtime::Result<bool> {\n    match value {\n        0 => Ok(false),\n        1 => Ok(true),\n        value => Err(wasmtime::Error::msg(format!(\n            \"invalid bool ABI value: {value}\"\n        ))),\n    }\n}\nfn bool_to_i32(value: bool) -> i32 {\n    i32::from(value)\n}",
+        "i8" => "fn i8_from_i32(value: i32) -> wasmtime::Result<i8> {\n    value\n        .try_into()\n        .map_err(|_| wasmtime::Error::msg(format!(\"invalid i8 ABI value: {value}\")))\n}\nfn i8_to_i32(value: i8) -> i32 {\n    value as i32\n}",
+        "i16" => "fn i16_from_i32(value: i32) -> wasmtime::Result<i16> {\n    value\n        .try_into()\n        .map_err(|_| wasmtime::Error::msg(format!(\"invalid i16 ABI value: {value}\")))\n}\nfn i16_to_i32(value: i16) -> i32 {\n    value as i32\n}",
+        "i32" => "fn i32_from_i32(value: i32) -> wasmtime::Result<i32> {\n    Ok(value)\n}\nfn i32_to_i32(value: i32) -> i32 {\n    value\n}",
+        "u8" => "fn u8_from_i32(value: i32) -> wasmtime::Result<u8> {\n    value\n        .try_into()\n        .map_err(|_| wasmtime::Error::msg(format!(\"invalid u8 ABI value: {value}\")))\n}\nfn u8_to_i32(value: u8) -> i32 {\n    value as i32\n}",
+        "u16" => "fn u16_from_i32(value: i32) -> wasmtime::Result<u16> {\n    value\n        .try_into()\n        .map_err(|_| wasmtime::Error::msg(format!(\"invalid u16 ABI value: {value}\")))\n}\nfn u16_to_i32(value: u16) -> i32 {\n    value as i32\n}",
+        "u32" => "fn u32_from_i32(value: i32) -> wasmtime::Result<u32> {\n    Ok(value as u32)\n}\nfn u32_to_i32(value: u32) -> i32 {\n    value as i32\n}",
+        "i64" => "fn i64_from_i64(value: i64) -> wasmtime::Result<i64> {\n    Ok(value)\n}\nfn i64_to_i64(value: i64) -> i64 {\n    value\n}",
+        "u64" => "fn u64_from_i64(value: i64) -> wasmtime::Result<u64> {\n    Ok(value as u64)\n}\nfn u64_to_i64(value: u64) -> i64 {\n    value as i64\n}",
+        "f32" => "fn f32_from_f32(value: f32) -> wasmtime::Result<f32> {\n    Ok(value)\n}\nfn f32_to_f32(value: f32) -> f32 {\n    value\n}",
+        "f64" => "fn f64_from_f64(value: f64) -> wasmtime::Result<f64> {\n    Ok(value)\n}\nfn f64_to_f64(value: f64) -> f64 {\n    value\n}",
         _ => unreachable!("scalar Core Wasm lowering table is closed"),
     }
 }
@@ -493,11 +495,11 @@ fn render_host_registration(function: &Function) -> String {
             )
         })
         .collect::<Vec<_>>()
-        .join("\n        ");
+        .join("\n            ");
     let decoded = if decoded.is_empty() {
         String::new()
     } else {
-        format!("{decoded}\n        ")
+        format!("{decoded}\n            ")
     };
     let names = function
         .args
@@ -516,7 +518,7 @@ fn render_host_registration(function: &Function) -> String {
             function.name
         ),
         None => format!(
-            "caller.data_mut().{}({names})?;\n        Ok(())",
+            "caller.data_mut().{}({names})?;\n            Ok(())",
             function.name
         ),
     };
@@ -526,10 +528,21 @@ fn render_host_registration(function: &Function) -> String {
     } else {
         format!(", {abi_arguments}")
     };
+    let closure = if abi_arguments.is_empty() {
+        format!(
+            "|mut caller: wasmtime::Caller<'_, T>| -> wasmtime::Result<{}> {{\n            {result}\n        }}",
+            render_abi_result_only(function)
+        )
+    } else {
+        let arguments = abi_arguments.trim_start_matches(", ");
+        format!(
+            "|mut caller: wasmtime::Caller<'_, T>,\n         {arguments}|\n         -> wasmtime::Result<{}> {{\n            {decoded}{result}\n        }}",
+            render_abi_result_only(function)
+        )
+    };
     format!(
-        "    linker.func_wrap(\"{ABI_NAMESPACE}\", \"{}\", |mut caller: wasmtime::Caller<'_, T>{abi_arguments}| -> wasmtime::Result<{}> {{\n        {decoded}{result}\n    }})?;",
-        function.name,
-        render_abi_result_only(function)
+        "    linker.func_wrap(\n        \"{ABI_NAMESPACE}\",\n        \"{}\",\n        {closure},\n    )?;",
+        function.name
     )
 }
 
@@ -543,10 +556,15 @@ fn render_host_invocation(function: &Function) -> String {
         Some(lowered) => decode_expression("raw", lowered),
         None => "Ok(())".to_owned(),
     };
+    let arguments = render_semantic_arguments(function);
+    let arguments = if arguments.is_empty() {
+        String::new()
+    } else {
+        format!(",\n    {arguments}")
+    };
     format!(
-        "pub(crate) fn invoke_{}<T>(store: &mut wasmtime::Store<T>, instance: &wasmtime::Instance, {}) -> wasmtime::Result<{}> {{\n    let function = instance.get_typed_func::<{}, {}>(&mut *store, \"{}\")?;\n    let raw = function.call(&mut *store, {call_arguments})?;\n    {result}\n}}",
+        "pub(crate) fn invoke_{}<T>(\n    store: &mut wasmtime::Store<T>,\n    instance: &wasmtime::Instance{arguments},\n) -> wasmtime::Result<{}> {{\n    let function = instance.get_typed_func::<{}, {}>(&mut *store, \"{}\")?;\n    let raw = function.call(&mut *store, {call_arguments})?;\n    {result}\n}}",
         function.name,
-        render_semantic_arguments(function),
         semantic_return(function),
         render_wasm_function_params(function),
         render_abi_result_only(function),
