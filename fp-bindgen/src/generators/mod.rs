@@ -1,15 +1,10 @@
+#[cfg(feature = "generators")]
+use crate::types::{Type, TypeIdent};
 use crate::{
     functions::FunctionList,
     types::{CargoDependency, TypeMap},
 };
-#[cfg(feature = "generators")]
-use crate::types::{Type, TypeIdent};
-use std::{
-    collections::BTreeMap,
-    error::Error,
-    fmt::Display,
-    io,
-};
+use std::{collections::BTreeMap, error::Error, fmt::Display, io};
 #[cfg(feature = "generators")]
 use std::{collections::BTreeSet, fs};
 
@@ -312,15 +307,24 @@ impl TsRuntimeConfig {}
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum WasmtimeCoreWasmError {
-    AsyncFunction { direction: &'static str, function: String },
+    AsyncFunction {
+        direction: &'static str,
+        function: String,
+    },
     UnsupportedValue {
         direction: &'static str,
         function: String,
         position: String,
         ty: String,
     },
-    UnsupportedTypeDefinition { name: String, ty: String },
-    Io { path: String, source: io::Error },
+    UnsupportedTypeDefinition {
+        name: String,
+        ty: String,
+    },
+    Io {
+        path: String,
+        source: io::Error,
+    },
 }
 
 impl Display for WasmtimeCoreWasmError {

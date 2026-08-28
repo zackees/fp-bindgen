@@ -371,9 +371,9 @@ use prelude::*;
 
 primitive_impls!();
 
+#[cfg(feature = "wasmtime-core-wasm")]
+pub use generators::try_generate_wasmtime_core_wasm_bindings;
 #[cfg(any(feature = "generators", feature = "wasmtime-core-wasm"))]
 pub use generators::{generate_bindings, BindingConfig, BindingsType, WasmtimeCoreWasmError};
 #[cfg(feature = "generators")]
 pub use generators::{RustPluginConfig, RustPluginConfigValue, TsRuntimeConfig};
-#[cfg(feature = "wasmtime-core-wasm")]
-pub use generators::try_generate_wasmtime_core_wasm_bindings;
