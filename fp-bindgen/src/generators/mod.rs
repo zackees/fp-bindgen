@@ -1,12 +1,15 @@
 #[cfg(feature = "generators")]
-use crate::types::{Type, TypeIdent};
-use crate::{
-    functions::FunctionList,
-    types::{CargoDependency, TypeMap},
-};
-use std::{collections::BTreeMap, error::Error, fmt::Display, io};
+use crate::types::CargoDependency;
 #[cfg(feature = "generators")]
-use std::{collections::BTreeSet, fs};
+use crate::types::{Type, TypeIdent};
+use crate::{functions::FunctionList, types::TypeMap};
+#[cfg(feature = "generators")]
+use std::collections::BTreeMap;
+#[cfg(feature = "generators")]
+use std::collections::BTreeSet;
+#[cfg(feature = "generators")]
+use std::fs;
+use std::{error::Error, fmt::Display, io};
 
 #[cfg(feature = "generators")]
 pub mod rust_plugin;
@@ -58,6 +61,7 @@ pub struct BindingConfig<'a> {
     pub path: &'a str,
 }
 
+#[cfg(feature = "generators")]
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct RustPluginConfig {
@@ -93,6 +97,7 @@ pub struct RustPluginConfig {
     pub publish: Option<RustPluginConfigValue>,
 }
 
+#[cfg(feature = "generators")]
 impl RustPluginConfig {
     pub fn builder() -> RustPluginConfigBuilder {
         RustPluginConfigBuilder {
@@ -110,6 +115,7 @@ impl RustPluginConfig {
     }
 }
 
+#[cfg(feature = "generators")]
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum RustPluginConfigValue {
@@ -119,40 +125,47 @@ pub enum RustPluginConfigValue {
     Bool(bool),
 }
 
+#[cfg(feature = "generators")]
 impl From<&str> for RustPluginConfigValue {
     fn from(value: &str) -> Self {
         Self::String(value.into())
     }
 }
 
+#[cfg(feature = "generators")]
 impl From<String> for RustPluginConfigValue {
     fn from(value: String) -> Self {
         Self::String(value)
     }
 }
 
+#[cfg(feature = "generators")]
 impl From<Vec<&str>> for RustPluginConfigValue {
     fn from(value: Vec<&str>) -> Self {
         Self::Vec(value.into_iter().map(|value| value.to_string()).collect())
     }
 }
 
+#[cfg(feature = "generators")]
 impl From<Vec<String>> for RustPluginConfigValue {
     fn from(value: Vec<String>) -> Self {
         Self::Vec(value)
     }
 }
 
+#[cfg(feature = "generators")]
 impl From<bool> for RustPluginConfigValue {
     fn from(value: bool) -> Self {
         Self::Bool(value)
     }
 }
 
+#[cfg(feature = "generators")]
 pub struct RustPluginConfigBuilder {
     config: RustPluginConfig,
 }
 
+#[cfg(feature = "generators")]
 impl RustPluginConfigBuilder {
     pub fn name(mut self, value: impl Into<String>) -> Self {
         self.config.name = Some(RustPluginConfigValue::String(value.into()));
@@ -228,6 +241,7 @@ impl RustPluginConfigBuilder {
     }
 }
 
+#[cfg(feature = "generators")]
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct TsRuntimeConfig {
@@ -263,6 +277,7 @@ pub struct TsRuntimeConfig {
     pub streaming_instantiation: bool,
 }
 
+#[cfg(feature = "generators")]
 impl TsRuntimeConfig {
     /// Returns a new config instance with default settings.
     pub fn new() -> Self {
@@ -288,6 +303,7 @@ impl TsRuntimeConfig {
     }
 }
 
+#[cfg(feature = "generators")]
 impl Default for TsRuntimeConfig {
     fn default() -> Self {
         Self {
@@ -298,6 +314,7 @@ impl Default for TsRuntimeConfig {
     }
 }
 
+#[cfg(feature = "generators")]
 impl TsRuntimeConfig {}
 
 /// A validation or filesystem error from the scalar Wasmtime Core Wasm generator.
@@ -495,6 +512,7 @@ fn display_warnings(
     );
 }
 
+#[cfg(feature = "generators")]
 fn warn_about_custom_serializer_usage<'a, T>(idents: T, context: &str, types: &TypeMap)
 where
     T: Iterator<Item = &'a TypeIdent>,
