@@ -10,7 +10,7 @@ use crate::{
     primitives::Primitive,
     types::{Type, TypeIdent, TypeMap},
 };
-use std::{fs, path::Path};
+use std::{collections::BTreeSet, fs, path::Path};
 
 const ABI_NAMESPACE: &str = "kernal-api:v1";
 const ABI_VERSION: u8 = 1;
@@ -401,6 +401,7 @@ fn render_guest_export_wrapper(function: &Function) -> String {
 }
 
 fn render_host_linker(import_functions: &FunctionList, export_functions: &FunctionList) -> String {
+    let helpers = render_host_helpers(import_functions, export_functions);
     let trait_methods = import_functions
         .iter()
         .map(render_host_trait_method)
@@ -419,33 +420,49 @@ fn render_host_linker(import_functions: &FunctionList, export_functions: &Functi
     format!(
         "// Generated private Wasmtime 45 glue for scalar Core Wasm ABI `{ABI_NAMESPACE}`.\n\
          // Host trait and invocation helpers use semantic Rust scalar types.\n\n\
-         fn bool_from_i32(value: i32) -> wasmtime::Result<bool> {{ match value {{ 0 => Ok(false), 1 => Ok(true), value => Err(wasmtime::Error::msg(format!(\"invalid bool ABI value: {{value}}\"))) }} }}\n\
-         fn i8_from_i32(value: i32) -> wasmtime::Result<i8> {{ value.try_into().map_err(|_| wasmtime::Error::msg(format!(\"invalid i8 ABI value: {{value}}\"))) }}\n\
-         fn i16_from_i32(value: i32) -> wasmtime::Result<i16> {{ value.try_into().map_err(|_| wasmtime::Error::msg(format!(\"invalid i16 ABI value: {{value}}\"))) }}\n\
-         fn u8_from_i32(value: i32) -> wasmtime::Result<u8> {{ value.try_into().map_err(|_| wasmtime::Error::msg(format!(\"invalid u8 ABI value: {{value}}\"))) }}\n\
-         fn u16_from_i32(value: i32) -> wasmtime::Result<u16> {{ value.try_into().map_err(|_| wasmtime::Error::msg(format!(\"invalid u16 ABI value: {{value}}\"))) }}\n\n\
-         fn i32_from_i32(value: i32) -> wasmtime::Result<i32> {{ Ok(value) }}\n\
-         fn u32_from_i32(value: i32) -> wasmtime::Result<u32> {{ Ok(value as u32) }}\n\
-         fn i64_from_i64(value: i64) -> wasmtime::Result<i64> {{ Ok(value) }}\n\
-         fn u64_from_i64(value: i64) -> wasmtime::Result<u64> {{ Ok(value as u64) }}\n\
-         fn f32_from_f32(value: f32) -> wasmtime::Result<f32> {{ Ok(value) }}\n\
-         fn f64_from_f64(value: f64) -> wasmtime::Result<f64> {{ Ok(value) }}\n\
-         fn bool_to_i32(value: bool) -> i32 {{ i32::from(value) }}\n\
-         fn i8_to_i32(value: i8) -> i32 {{ value as i32 }}\n\
-         fn i16_to_i32(value: i16) -> i32 {{ value as i32 }}\n\
-         fn i32_to_i32(value: i32) -> i32 {{ value }}\n\
-         fn u8_to_i32(value: u8) -> i32 {{ value as i32 }}\n\
-         fn u16_to_i32(value: u16) -> i32 {{ value as i32 }}\n\
-         fn u32_to_i32(value: u32) -> i32 {{ value as i32 }}\n\
-         fn i64_to_i64(value: i64) -> i64 {{ value }}\n\
-         fn u64_to_i64(value: u64) -> i64 {{ value as i64 }}\n\
-         fn f32_to_f32(value: f32) -> f32 {{ value }}\n\
-         fn f64_to_f64(value: f64) -> f64 {{ value }}\n\n\
+         {helpers}\n\n\
          pub(crate) trait KernalApiV1Imports {{\n{trait_methods}\n}}\n\n\
          pub(crate) fn link_kernal_api_v1<T>(linker: &mut wasmtime::Linker<T>) -> wasmtime::Result<()>\n\
          where T: KernalApiV1Imports + Send + 'static,\n{{\n{registrations}\n    Ok(())\n}}\n\n\
          {invocations}\n"
     )
+}
+
+fn render_host_helpers(import_functions: &FunctionList, export_functions: &FunctionList) -> String {
+    let mut used = BTreeSet::new();
+    for function in import_functions.iter().chain(export_functions.iter()) {
+        for argument in &function.args {
+            used.insert(lower_value_type_unchecked(&argument.ty).semantic);
+        }
+        if let Some(return_type) = &function.return_type {
+            if let Some(lowered) = lower_return_type_unchecked(return_type) {
+                used.insert(lowered.semantic);
+            }
+        }
+    }
+    ["bool", "i8", "i16", "i32", "u8", "u16", "u32", "i64", "u64", "f32", "f64"]
+        .iter()
+        .filter(|semantic| used.contains(*semantic))
+        .map(|semantic| host_helper_source(semantic))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn host_helper_source(semantic: &str) -> &'static str {
+    match semantic {
+        "bool" => "fn bool_from_i32(value: i32) -> wasmtime::Result<bool> { match value { 0 => Ok(false), 1 => Ok(true), value => Err(wasmtime::Error::msg(format!(\"invalid bool ABI value: {value}\"))) } }\nfn bool_to_i32(value: bool) -> i32 { i32::from(value) }",
+        "i8" => "fn i8_from_i32(value: i32) -> wasmtime::Result<i8> { value.try_into().map_err(|_| wasmtime::Error::msg(format!(\"invalid i8 ABI value: {value}\"))) }\nfn i8_to_i32(value: i8) -> i32 { value as i32 }",
+        "i16" => "fn i16_from_i32(value: i32) -> wasmtime::Result<i16> { value.try_into().map_err(|_| wasmtime::Error::msg(format!(\"invalid i16 ABI value: {value}\"))) }\nfn i16_to_i32(value: i16) -> i32 { value as i32 }",
+        "i32" => "fn i32_from_i32(value: i32) -> wasmtime::Result<i32> { Ok(value) }\nfn i32_to_i32(value: i32) -> i32 { value }",
+        "u8" => "fn u8_from_i32(value: i32) -> wasmtime::Result<u8> { value.try_into().map_err(|_| wasmtime::Error::msg(format!(\"invalid u8 ABI value: {value}\"))) }\nfn u8_to_i32(value: u8) -> i32 { value as i32 }",
+        "u16" => "fn u16_from_i32(value: i32) -> wasmtime::Result<u16> { value.try_into().map_err(|_| wasmtime::Error::msg(format!(\"invalid u16 ABI value: {value}\"))) }\nfn u16_to_i32(value: u16) -> i32 { value as i32 }",
+        "u32" => "fn u32_from_i32(value: i32) -> wasmtime::Result<u32> { Ok(value as u32) }\nfn u32_to_i32(value: u32) -> i32 { value as i32 }",
+        "i64" => "fn i64_from_i64(value: i64) -> wasmtime::Result<i64> { Ok(value) }\nfn i64_to_i64(value: i64) -> i64 { value }",
+        "u64" => "fn u64_from_i64(value: i64) -> wasmtime::Result<u64> { Ok(value as u64) }\nfn u64_to_i64(value: u64) -> i64 { value as i64 }",
+        "f32" => "fn f32_from_f32(value: f32) -> wasmtime::Result<f32> { Ok(value) }\nfn f32_to_f32(value: f32) -> f32 { value }",
+        "f64" => "fn f64_from_f64(value: f64) -> wasmtime::Result<f64> { Ok(value) }\nfn f64_to_f64(value: f64) -> f64 { value }",
+        _ => unreachable!("scalar Core Wasm lowering table is closed"),
+    }
 }
 
 fn render_host_trait_method(function: &Function) -> String {
@@ -468,13 +485,18 @@ fn render_host_registration(function: &Function) -> String {
         .iter()
         .map(|argument| {
             format!(
-                "let {} = {};",
+                "let {} = {}?;",
                 argument.name,
                 decode_expression(&argument.name, lower_value_type_unchecked(&argument.ty))
             )
         })
         .collect::<Vec<_>>()
         .join("\n        ");
+    let decoded = if decoded.is_empty() {
+        String::new()
+    } else {
+        format!("{decoded}\n        ")
+    };
     let names = function
         .args
         .iter()
@@ -503,24 +525,14 @@ fn render_host_registration(function: &Function) -> String {
         format!(", {abi_arguments}")
     };
     format!(
-        "    linker.func_wrap(\"{ABI_NAMESPACE}\", \"{}\", |mut caller: wasmtime::Caller<'_, T>{abi_arguments}| -> wasmtime::Result<{}> {{\n        {decoded}\n        {result}\n    }})?;",
+        "    linker.func_wrap(\"{ABI_NAMESPACE}\", \"{}\", |mut caller: wasmtime::Caller<'_, T>{abi_arguments}| -> wasmtime::Result<{}> {{\n        {decoded}{result}\n    }})?;",
         function.name,
         render_abi_result_only(function)
     )
 }
 
 fn render_host_invocation(function: &Function) -> String {
-    let call_arguments = function
-        .args
-        .iter()
-        .map(|argument| encode_expression(&argument.name, lower_value_type_unchecked(&argument.ty)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let call_arguments = if call_arguments.is_empty() {
-        "()".to_owned()
-    } else {
-        call_arguments
-    };
+    let call_arguments = render_wasm_call_params(function);
     let result = match function
         .return_type
         .as_ref()
@@ -633,6 +645,19 @@ fn render_wasm_function_params(function: &Function) -> String {
     match params.as_slice() {
         [] => "()".to_owned(),
         [one] => (*one).to_owned(),
+        many => format!("({})", many.join(", ")),
+    }
+}
+
+fn render_wasm_call_params(function: &Function) -> String {
+    let params = function
+        .args
+        .iter()
+        .map(|argument| encode_expression(&argument.name, lower_value_type_unchecked(&argument.ty)))
+        .collect::<Vec<_>>();
+    match params.as_slice() {
+        [] => "()".to_owned(),
+        [one] => one.clone(),
         many => format!("({})", many.join(", ")),
     }
 }
@@ -794,10 +819,11 @@ results = [{ semantic = "f64", abi = "f64" }]
         assert!(rendered
             .guest_source
             .contains("match value { 0 => Ok(false), 1 => Ok(true)"));
-        assert!(rendered
-            .guest_source
-            .contains("i8_from_i32(value: i32) -> Result<i8, AbiError>"));
-        assert!(rendered
+        let mut narrow_imports = FunctionList::new();
+        narrow_imports.add_function("fn narrow(value: u8) -> u16;");
+        let narrow = render_bindings(&narrow_imports, &FunctionList::new(), &TypeMap::new())
+            .unwrap();
+        assert!(narrow
             .host_linker
             .contains("u16_from_i32(value: i32) -> wasmtime::Result<u16>"));
         assert!(rendered.guest_source.contains("u64_to_i64"));
@@ -854,5 +880,20 @@ results = [{ semantic = "f64", abi = "f64" }]
         assert!(!dependencies.contains_key("wasmer"));
         assert!(!dependencies.contains_key("tokio"));
         assert!(!dependencies.contains_key("fp-bindgen-support"));
+    }
+
+    #[test]
+    fn wasmtime45_compile_fixture_is_exact_generated_host_golden() {
+        let mut imports = FunctionList::new();
+        imports.add_function("fn checked(flag: bool, tiny: u8, total: u64) -> bool;");
+        imports.add_function("fn reset();");
+        let mut exports = FunctionList::new();
+        exports.add_function("fn guest_measure(value: i16, ratio: f32) -> u16;");
+        exports.add_function("fn guest_unit();");
+        let rendered = render_bindings(&imports, &exports, &TypeMap::new()).unwrap();
+        assert_eq!(
+            rendered.host_linker,
+            include_str!("../../tests/fixtures/wasmtime45_scalar_host.rs")
+        );
     }
 }

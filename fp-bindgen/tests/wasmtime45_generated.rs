@@ -9,6 +9,10 @@ impl generated::KernalApiV1Imports for Host {
     fn checked(&mut self, flag: bool, tiny: u8, total: u64) -> wasmtime::Result<bool> {
         Ok(flag && tiny == 7 && total == u64::MAX)
     }
+
+    fn reset(&mut self) -> wasmtime::Result<()> {
+        Ok(())
+    }
 }
 
 #[test]
