@@ -181,7 +181,9 @@ Currently, we support the following binding types:
 - `BindingsType::RustWasmerRuntime`: Generates runtime bindings for use with Wasmer.
 - `BindingsType::RustWasmtimeCoreWasm`: Generates a deterministic, scalar-only Core Wasm ABI
   (`kernal-api:v1`) for a Wasmtime 45 host. This v0 target rejects async and all bulk or
-  user-defined values rather than using the legacy allocation or serialization protocol.
+  user-defined values rather than using the legacy allocation or serialization protocol. Enable
+  the dependency-free `wasmtime-core-wasm` feature; use
+  `try_generate_wasmtime_core_wasm_bindings` when output errors must be handled explicitly.
 - `BindingsType::TsRuntimeWithExtendedConfig`: Generates bindings for a TypeScript runtime.
 
 Note that some binding types take an additional config argument.
@@ -355,7 +357,7 @@ See [LICENSE-APACHE](LICENSE-APACHE) and [LICENSE-MIT](LICENSE-MIT).
 mod casing;
 mod docs;
 mod functions;
-#[cfg(feature = "generators")]
+#[cfg(any(feature = "generators", feature = "wasmtime-core-wasm"))]
 mod generators;
 mod serializable;
 
@@ -369,8 +371,9 @@ use prelude::*;
 
 primitive_impls!();
 
+#[cfg(any(feature = "generators", feature = "wasmtime-core-wasm"))]
+pub use generators::{generate_bindings, BindingConfig, BindingsType, WasmtimeCoreWasmError};
 #[cfg(feature = "generators")]
-pub use generators::{
-    generate_bindings, try_generate_wasmtime_core_wasm_bindings, BindingConfig, BindingsType,
-    RustPluginConfig, RustPluginConfigValue, TsRuntimeConfig, WasmtimeCoreWasmError,
-};
+pub use generators::{RustPluginConfig, RustPluginConfigValue, TsRuntimeConfig};
+#[cfg(feature = "wasmtime-core-wasm")]
+pub use generators::try_generate_wasmtime_core_wasm_bindings;

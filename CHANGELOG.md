@@ -8,8 +8,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## unreleased
 
-- Add a deterministic, scalar-only Wasmtime Core Wasm generator for the
-  `kernal-api:v1` ABI.
+- Add a dependency-free, deterministic, scalar-only Wasmtime Core Wasm generator for the
+  `kernal-api:v1` ABI, including a versioned TOML manifest and typed guest/host source templates.
 - Add ability to add `publish` to the generated Cargo.toml file (#208)
 - Fix generating publish value as a toml bool (#209)
 
