@@ -534,7 +534,9 @@ fn render_host_registration(function: &Function) -> String {
             render_abi_result_only(function)
         )
     } else {
-        let arguments = abi_arguments.trim_start_matches(", ");
+        let arguments = abi_arguments
+            .trim_start_matches(", ")
+            .replace(", ", ",\n         ");
         format!(
             "|mut caller: wasmtime::Caller<'_, T>,\n         {arguments}|\n         -> wasmtime::Result<{}> {{\n            {decoded}{result}\n        }}",
             render_abi_result_only(function)
@@ -560,7 +562,7 @@ fn render_host_invocation(function: &Function) -> String {
     let arguments = if arguments.is_empty() {
         String::new()
     } else {
-        format!(",\n    {arguments}")
+        format!(",\n    {}", arguments.replace(", ", ",\n    "))
     };
     format!(
         "pub(crate) fn invoke_{}<T>(\n    store: &mut wasmtime::Store<T>,\n    instance: &wasmtime::Instance{arguments},\n) -> wasmtime::Result<{}> {{\n    let function = instance.get_typed_func::<{}, {}>(&mut *store, \"{}\")?;\n    let raw = function.call(&mut *store, {call_arguments})?;\n    {result}\n}}",
