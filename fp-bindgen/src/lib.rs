@@ -179,6 +179,9 @@ Currently, we support the following binding types:
 
 - `BindingsType::RustPlugin`: Generates bindings for a Rust plugin.
 - `BindingsType::RustWasmerRuntime`: Generates runtime bindings for use with Wasmer.
+- `BindingsType::RustWasmtimeCoreWasm`: Generates a deterministic, scalar-only Core Wasm ABI
+  (`kernal-api:v1`) for a Wasmtime 45 host. This v0 target rejects async and all bulk or
+  user-defined values rather than using the legacy allocation or serialization protocol.
 - `BindingsType::TsRuntimeWithExtendedConfig`: Generates bindings for a TypeScript runtime.
 
 Note that some binding types take an additional config argument.
@@ -368,6 +371,6 @@ primitive_impls!();
 
 #[cfg(feature = "generators")]
 pub use generators::{
-    generate_bindings, BindingConfig, BindingsType, RustPluginConfig, RustPluginConfigValue,
-    TsRuntimeConfig,
+    generate_bindings, try_generate_wasmtime_core_wasm_bindings, BindingConfig, BindingsType,
+    RustPluginConfig, RustPluginConfigValue, TsRuntimeConfig, WasmtimeCoreWasmError,
 };

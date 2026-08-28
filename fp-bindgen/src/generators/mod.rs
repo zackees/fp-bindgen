@@ -4,14 +4,16 @@ use crate::{
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
+    error::Error,
     fmt::Display,
-    fs,
+    fs, io,
 };
 
 pub mod rust_plugin;
 pub mod rust_wasmer2_runtime;
 pub mod rust_wasmer2_wasi_runtime;
 pub mod ts_runtime;
+mod wasmtime_core_wasm;
 
 #[non_exhaustive]
 #[derive(Debug, Clone)]
@@ -19,6 +21,8 @@ pub enum BindingsType {
     RustPlugin(RustPluginConfig),
     RustWasmer2Runtime,
     RustWasmer2WasiRuntime,
+    /// Generates the scalar-only `kernal-api:v1` Core Wasm ABI for Wasmtime 45 hosts.
+    RustWasmtimeCoreWasm,
     TsRuntime(TsRuntimeConfig),
 }
 
@@ -28,6 +32,7 @@ impl Display for BindingsType {
             BindingsType::RustPlugin { .. } => "rust-plugin",
             BindingsType::RustWasmer2Runtime { .. } => "rust-wasmer2-runtime",
             BindingsType::RustWasmer2WasiRuntime { .. } => "rust-wasmer2-wasi-runtime",
+            BindingsType::RustWasmtimeCoreWasm { .. } => "rust-wasmtime-core-wasm",
             BindingsType::TsRuntime { .. } => "ts-runtime",
         })
     }
@@ -281,12 +286,91 @@ impl Default for TsRuntimeConfig {
 
 impl TsRuntimeConfig {}
 
+/// A validation or filesystem error from the scalar Wasmtime Core Wasm generator.
+///
+/// This generator intentionally rejects every value that would require the legacy
+/// allocation, serialization, or async protocol before it creates an output directory.
+#[non_exhaustive]
+#[derive(Debug)]
+pub enum WasmtimeCoreWasmError {
+    AsyncFunction { direction: &'static str, function: String },
+    UnsupportedValue {
+        direction: &'static str,
+        function: String,
+        position: String,
+        ty: String,
+    },
+    UnsupportedTypeDefinition { name: String, ty: String },
+    Io { path: String, source: io::Error },
+}
+
+impl Display for WasmtimeCoreWasmError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AsyncFunction {
+                direction,
+                function,
+            } => write!(
+                f,
+                "{direction} function `{function}` is async; the Wasmtime Core Wasm v0 ABI is synchronous"
+            ),
+            Self::UnsupportedValue {
+                direction,
+                function,
+                position,
+                ty,
+            } => write!(
+                f,
+                "{direction} function `{function}` has unsupported {position} type `{ty}`; the Wasmtime Core Wasm v0 ABI accepts only scalar values"
+            ),
+            Self::UnsupportedTypeDefinition { name, ty } => write!(
+                f,
+                "type definition `{name}` (`{ty}`) is unsupported; the Wasmtime Core Wasm v0 ABI has no bulk or user-defined types"
+            ),
+            Self::Io { path, source } => write!(f, "could not write `{path}`: {source}"),
+        }
+    }
+}
+
+impl Error for WasmtimeCoreWasmError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+/// Generates the scalar-only `kernal-api:v1` Core Wasm ABI and reports validation errors.
+///
+/// Unlike the historical binding targets, this entry point never falls back to a FatPtr or
+/// serialization path. Invalid declarations are rejected before any output is written.
+pub fn try_generate_wasmtime_core_wasm_bindings(
+    import_functions: FunctionList,
+    export_functions: FunctionList,
+    types: TypeMap,
+    path: &str,
+) -> Result<(), WasmtimeCoreWasmError> {
+    wasmtime_core_wasm::generate_bindings(import_functions, export_functions, types, path)
+}
+
 pub fn generate_bindings(
     import_functions: FunctionList,
     export_functions: FunctionList,
     types: TypeMap,
     config: BindingConfig,
 ) {
+    if matches!(&config.bindings_type, BindingsType::RustWasmtimeCoreWasm) {
+        try_generate_wasmtime_core_wasm_bindings(
+            import_functions,
+            export_functions,
+            types,
+            config.path,
+        )
+        .unwrap_or_else(|error| panic!("Could not generate Wasmtime Core Wasm bindings: {error}"));
+        return;
+    }
+
     fs::create_dir_all(config.path).expect("Could not create output directory");
 
     display_warnings(&import_functions, &export_functions, &types);
@@ -310,6 +394,9 @@ pub fn generate_bindings(
             export_functions,
             types,
             config.path,
+        ),
+        BindingsType::RustWasmtimeCoreWasm => unreachable!(
+            "the Wasmtime Core Wasm binding target returns before legacy generator dispatch"
         ),
         BindingsType::TsRuntime(runtime_config) => ts_runtime::generate_bindings(
             import_functions,

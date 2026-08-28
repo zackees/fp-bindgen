@@ -4,6 +4,7 @@ pub use crate::serializable::Serializable;
 pub use crate::types::{CustomType, Type, TypeIdent, TypeMap};
 #[cfg(feature = "generators")]
 pub use crate::{
-    BindingConfig, BindingsType, RustPluginConfig, RustPluginConfigValue, TsRuntimeConfig,
+    try_generate_wasmtime_core_wasm_bindings, BindingConfig, BindingsType, RustPluginConfig,
+    RustPluginConfigValue, TsRuntimeConfig, WasmtimeCoreWasmError,
 };
 pub use fp_bindgen_macros::*;
