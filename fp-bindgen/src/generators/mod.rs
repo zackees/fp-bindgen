@@ -1,33 +1,55 @@
-use crate::{
-    functions::FunctionList,
-    types::{CargoDependency, Type, TypeIdent, TypeMap},
-};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fmt::Display,
-    fs,
-};
+#[cfg(feature = "generators")]
+use crate::types::CargoDependency;
+#[cfg(feature = "generators")]
+use crate::types::{Type, TypeIdent};
+use crate::{functions::FunctionList, types::TypeMap};
+#[cfg(feature = "generators")]
+use std::collections::BTreeMap;
+#[cfg(feature = "generators")]
+use std::collections::BTreeSet;
+#[cfg(feature = "generators")]
+use std::fs;
+use std::{error::Error, fmt::Display, io};
 
+#[cfg(feature = "generators")]
 pub mod rust_plugin;
+#[cfg(feature = "generators")]
 pub mod rust_wasmer2_runtime;
+#[cfg(feature = "generators")]
 pub mod rust_wasmer2_wasi_runtime;
+#[cfg(feature = "generators")]
 pub mod ts_runtime;
+#[cfg(feature = "wasmtime-core-wasm")]
+mod wasmtime_core_wasm;
 
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum BindingsType {
+    #[cfg(feature = "generators")]
     RustPlugin(RustPluginConfig),
+    #[cfg(feature = "generators")]
     RustWasmer2Runtime,
+    #[cfg(feature = "generators")]
     RustWasmer2WasiRuntime,
+    #[cfg(feature = "wasmtime-core-wasm")]
+    /// Generates the scalar-only `kernal-api:v1` Core Wasm ABI for Wasmtime 45 hosts.
+    RustWasmtimeCoreWasm,
+    #[cfg(feature = "generators")]
     TsRuntime(TsRuntimeConfig),
 }
 
 impl Display for BindingsType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
+            #[cfg(feature = "generators")]
             BindingsType::RustPlugin { .. } => "rust-plugin",
-            BindingsType::RustWasmer2Runtime { .. } => "rust-wasmer2-runtime",
-            BindingsType::RustWasmer2WasiRuntime { .. } => "rust-wasmer2-wasi-runtime",
+            #[cfg(feature = "generators")]
+            BindingsType::RustWasmer2Runtime => "rust-wasmer2-runtime",
+            #[cfg(feature = "generators")]
+            BindingsType::RustWasmer2WasiRuntime => "rust-wasmer2-wasi-runtime",
+            #[cfg(feature = "wasmtime-core-wasm")]
+            BindingsType::RustWasmtimeCoreWasm => "rust-wasmtime-core-wasm",
+            #[cfg(feature = "generators")]
             BindingsType::TsRuntime { .. } => "ts-runtime",
         })
     }
@@ -39,6 +61,7 @@ pub struct BindingConfig<'a> {
     pub path: &'a str,
 }
 
+#[cfg(feature = "generators")]
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct RustPluginConfig {
@@ -74,6 +97,7 @@ pub struct RustPluginConfig {
     pub publish: Option<RustPluginConfigValue>,
 }
 
+#[cfg(feature = "generators")]
 impl RustPluginConfig {
     pub fn builder() -> RustPluginConfigBuilder {
         RustPluginConfigBuilder {
@@ -91,6 +115,7 @@ impl RustPluginConfig {
     }
 }
 
+#[cfg(feature = "generators")]
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum RustPluginConfigValue {
@@ -100,40 +125,47 @@ pub enum RustPluginConfigValue {
     Bool(bool),
 }
 
+#[cfg(feature = "generators")]
 impl From<&str> for RustPluginConfigValue {
     fn from(value: &str) -> Self {
         Self::String(value.into())
     }
 }
 
+#[cfg(feature = "generators")]
 impl From<String> for RustPluginConfigValue {
     fn from(value: String) -> Self {
         Self::String(value)
     }
 }
 
+#[cfg(feature = "generators")]
 impl From<Vec<&str>> for RustPluginConfigValue {
     fn from(value: Vec<&str>) -> Self {
         Self::Vec(value.into_iter().map(|value| value.to_string()).collect())
     }
 }
 
+#[cfg(feature = "generators")]
 impl From<Vec<String>> for RustPluginConfigValue {
     fn from(value: Vec<String>) -> Self {
         Self::Vec(value)
     }
 }
 
+#[cfg(feature = "generators")]
 impl From<bool> for RustPluginConfigValue {
     fn from(value: bool) -> Self {
         Self::Bool(value)
     }
 }
 
+#[cfg(feature = "generators")]
 pub struct RustPluginConfigBuilder {
     config: RustPluginConfig,
 }
 
+#[cfg(feature = "generators")]
 impl RustPluginConfigBuilder {
     pub fn name(mut self, value: impl Into<String>) -> Self {
         self.config.name = Some(RustPluginConfigValue::String(value.into()));
@@ -209,6 +241,7 @@ impl RustPluginConfigBuilder {
     }
 }
 
+#[cfg(feature = "generators")]
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct TsRuntimeConfig {
@@ -244,6 +277,7 @@ pub struct TsRuntimeConfig {
     pub streaming_instantiation: bool,
 }
 
+#[cfg(feature = "generators")]
 impl TsRuntimeConfig {
     /// Returns a new config instance with default settings.
     pub fn new() -> Self {
@@ -269,6 +303,7 @@ impl TsRuntimeConfig {
     }
 }
 
+#[cfg(feature = "generators")]
 impl Default for TsRuntimeConfig {
     fn default() -> Self {
         Self {
@@ -279,48 +314,153 @@ impl Default for TsRuntimeConfig {
     }
 }
 
+#[cfg(feature = "generators")]
 impl TsRuntimeConfig {}
+
+/// A validation or filesystem error from the scalar Wasmtime Core Wasm generator.
+///
+/// This generator intentionally rejects every value that would require the legacy
+/// allocation, serialization, or async protocol before it creates an output directory.
+#[non_exhaustive]
+#[derive(Debug)]
+pub enum WasmtimeCoreWasmError {
+    AsyncFunction {
+        direction: &'static str,
+        function: String,
+    },
+    UnsupportedValue {
+        direction: &'static str,
+        function: String,
+        position: String,
+        ty: String,
+    },
+    UnsupportedTypeDefinition {
+        name: String,
+        ty: String,
+    },
+    Io {
+        path: String,
+        source: io::Error,
+    },
+}
+
+impl Display for WasmtimeCoreWasmError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AsyncFunction {
+                direction,
+                function,
+            } => write!(
+                f,
+                "{direction} function `{function}` is async; the Wasmtime Core Wasm v0 ABI is synchronous"
+            ),
+            Self::UnsupportedValue {
+                direction,
+                function,
+                position,
+                ty,
+            } => write!(
+                f,
+                "{direction} function `{function}` has unsupported {position} type `{ty}`; the Wasmtime Core Wasm v0 ABI accepts only scalar values"
+            ),
+            Self::UnsupportedTypeDefinition { name, ty } => write!(
+                f,
+                "type definition `{name}` (`{ty}`) is unsupported; the Wasmtime Core Wasm v0 ABI has no bulk or user-defined types"
+            ),
+            Self::Io { path, source } => write!(f, "could not write `{path}`: {source}"),
+        }
+    }
+}
+
+impl Error for WasmtimeCoreWasmError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+/// Generates the scalar-only `kernal-api:v1` Core Wasm ABI and reports validation errors.
+///
+/// Unlike the historical binding targets, this entry point never falls back to a FatPtr or
+/// serialization path. Invalid declarations are rejected before any output is written.
+#[cfg(feature = "wasmtime-core-wasm")]
+pub fn try_generate_wasmtime_core_wasm_bindings(
+    import_functions: FunctionList,
+    export_functions: FunctionList,
+    types: TypeMap,
+    path: &str,
+) -> Result<(), WasmtimeCoreWasmError> {
+    wasmtime_core_wasm::generate_bindings(import_functions, export_functions, types, path)
+}
 
 pub fn generate_bindings(
     import_functions: FunctionList,
     export_functions: FunctionList,
     types: TypeMap,
     config: BindingConfig,
-) {
-    fs::create_dir_all(config.path).expect("Could not create output directory");
-
-    display_warnings(&import_functions, &export_functions, &types);
+) -> Result<(), WasmtimeCoreWasmError> {
+    #[cfg(feature = "generators")]
+    {
+        fs::create_dir_all(config.path).expect("Could not create output directory");
+        display_warnings(&import_functions, &export_functions, &types);
+    }
 
     match config.bindings_type {
-        BindingsType::RustPlugin(plugin_config) => rust_plugin::generate_bindings(
-            import_functions,
-            export_functions,
-            types,
-            plugin_config,
-            config.path,
-        ),
-        BindingsType::RustWasmer2Runtime => rust_wasmer2_runtime::generate_bindings(
+        #[cfg(feature = "wasmtime-core-wasm")]
+        BindingsType::RustWasmtimeCoreWasm => try_generate_wasmtime_core_wasm_bindings(
             import_functions,
             export_functions,
             types,
             config.path,
         ),
-        BindingsType::RustWasmer2WasiRuntime => rust_wasmer2_wasi_runtime::generate_bindings(
-            import_functions,
-            export_functions,
-            types,
-            config.path,
-        ),
-        BindingsType::TsRuntime(runtime_config) => ts_runtime::generate_bindings(
-            import_functions,
-            export_functions,
-            types,
-            runtime_config,
-            config.path,
-        ),
-    };
+        #[cfg(feature = "generators")]
+        BindingsType::RustPlugin(plugin_config) => {
+            rust_plugin::generate_bindings(
+                import_functions,
+                export_functions,
+                types,
+                plugin_config,
+                config.path,
+            );
+            Ok(())
+        }
+        #[cfg(feature = "generators")]
+        BindingsType::RustWasmer2Runtime => {
+            rust_wasmer2_runtime::generate_bindings(
+                import_functions,
+                export_functions,
+                types,
+                config.path,
+            );
+            Ok(())
+        }
+        #[cfg(feature = "generators")]
+        BindingsType::RustWasmer2WasiRuntime => {
+            rust_wasmer2_wasi_runtime::generate_bindings(
+                import_functions,
+                export_functions,
+                types,
+                config.path,
+            );
+            Ok(())
+        }
+        #[cfg(feature = "generators")]
+        BindingsType::TsRuntime(runtime_config) => {
+            ts_runtime::generate_bindings(
+                import_functions,
+                export_functions,
+                types,
+                runtime_config,
+                config.path,
+            );
+            Ok(())
+        }
+    }
 }
 
+#[cfg(feature = "generators")]
 fn display_warnings(
     import_functions: &FunctionList,
     export_functions: &FunctionList,
@@ -372,6 +512,7 @@ fn display_warnings(
     );
 }
 
+#[cfg(feature = "generators")]
 fn warn_about_custom_serializer_usage<'a, T>(idents: T, context: &str, types: &TypeMap)
 where
     T: Iterator<Item = &'a TypeIdent>,
