@@ -69,6 +69,11 @@ jobs:
         run: |
           rustup target add wasm32-unknown-unknown wasm32-wasi
 
+      - name: Verify generated Core Wasm guest compiles
+        run: >-
+          cargo test -p fp-bindgen --no-default-features
+          --features wasmtime-core-wasm --test wasmtime_core_wasm_async
+
       - name: Verify example-plugin builds
         run: |
           pushd examples/example-plugin

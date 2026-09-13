@@ -363,7 +363,12 @@ fn render_guest_typed_import(function: &Function) -> String {
     let call_arguments = function
         .args
         .iter()
-        .map(|argument| encode_expression(&argument.name, lower_value_type_unchecked(&argument.ty)))
+        .map(|argument| {
+            format!(
+                "super::{}",
+                encode_expression(&argument.name, lower_value_type_unchecked(&argument.ty))
+            )
+        })
         .collect::<Vec<_>>()
         .join(", ");
     let call = format!(
@@ -386,7 +391,7 @@ fn render_guest_typed_import(function: &Function) -> String {
     {
         Some(lowered) => format!(
             "let raw = {call};\n        {}",
-            decode_expression("raw", lowered)
+            format!("super::{}", decode_expression("raw", lowered))
         ),
         None => format!("{call};\n        Ok(())"),
     };

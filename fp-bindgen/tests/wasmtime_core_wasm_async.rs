@@ -1,11 +1,41 @@
 #![cfg(feature = "wasmtime-core-wasm")]
 
 use fp_bindgen::prelude::*;
+use std::{path::Path, process::Command};
+
+fn build_generated_guest(output: &Path) {
+    let build = Command::new(env!("CARGO"))
+        .args([
+            "build",
+            "--offline",
+            "--target",
+            "wasm32-unknown-unknown",
+            "--target-dir",
+        ])
+        .arg(output.join("target"))
+        .arg("--manifest-path")
+        .arg(output.join("Cargo.toml"))
+        .output()
+        .expect("run Cargo for generated guest");
+    assert!(
+        build.status.success(),
+        "generated guest must build to Core Wasm:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+    assert!(
+        output
+            .join("target/wasm32-unknown-unknown/debug/kernal_api_v1_bindings.wasm")
+            .is_file(),
+        "generated cdylib must produce a Core Wasm artifact"
+    );
+}
 
 #[test]
 fn async_import_generates_a_bounded_operation_handle_protocol() {
     let mut imports = FunctionList::new();
     imports.add_function("async fn pending_total(seed: u32) -> u32;");
+    imports.add_function("fn current_total() -> u32;");
     let output = std::env::temp_dir().join(format!(
         "fp-bindgen-wasmtime-core-wasm-async-{}",
         std::process::id()
@@ -49,6 +79,12 @@ fn async_import_generates_a_bounded_operation_handle_protocol() {
             "name = \"{control}\"\ndirection = \"guest-to-host\"\ngenerated = true"
         )));
     }
+
+    // This is the actual guest boundary: the generated scalar operation
+    // protocol must compile as a Core Wasm cdylib, not merely parse as Rust.
+    // `--offline` also proves the emitted guest has no hidden runtime crate
+    // dependency to resolve.
+    build_generated_guest(&output);
 
     std::fs::remove_dir_all(output).unwrap();
 }
