@@ -2,7 +2,7 @@
 //!
 //! This target is intentionally independent from the legacy Wasmer generators.
 //! It emits source text only and never selects an allocation, serialization, or
-//! async transport protocol.
+//! async transport protocol, except for explicit scalar operation handles on imports.
 
 use crate::{
     functions::{Function, FunctionList},
@@ -21,6 +21,12 @@ const GUEST_CARGO_FILE: &str = "Cargo.toml";
 const GUEST_SOURCE_FILE: &str = "src/lib.rs";
 const HOST_LINKER_FILE: &str = "wasmtime45_host_linker.rs";
 const MANIFEST_FILE: &str = "kernal-api-v1.abi.toml";
+const OPERATION_CONTROLS: [&str; 4] = [
+    "poll_operation",
+    "take_operation_result",
+    "yield_operation",
+    "cancel_operation",
+];
 
 struct RenderedBindings {
     guest_cargo: String,
@@ -62,8 +68,8 @@ fn render_bindings(
     export_functions: &FunctionList,
     types: &TypeMap,
 ) -> Result<RenderedBindings, WasmtimeCoreWasmError> {
-    validate_functions(import_functions, "import")?;
-    validate_functions(export_functions, "export")?;
+    validate_functions(import_functions, "import", true)?;
+    validate_functions(export_functions, "export", false)?;
     validate_type_definitions(types)?;
     Ok(RenderedBindings {
         guest_cargo: render_guest_cargo(),
@@ -76,10 +82,17 @@ fn render_bindings(
 fn validate_functions(
     functions: &FunctionList,
     direction: &'static str,
+    allow_async: bool,
 ) -> Result<(), WasmtimeCoreWasmError> {
     for function in functions {
-        if function.is_async {
+        if function.is_async && !allow_async {
             return Err(WasmtimeCoreWasmError::AsyncFunction {
+                direction,
+                function: function.name.clone(),
+            });
+        }
+        if OPERATION_CONTROLS.contains(&function.name.as_str()) {
+            return Err(WasmtimeCoreWasmError::ReservedOperationControl {
                 direction,
                 function: function.name.clone(),
             });
@@ -236,6 +249,7 @@ fn render_guest_cargo() -> String {
 }
 
 fn render_guest_source(import_functions: &FunctionList, export_functions: &FunctionList) -> String {
+    let has_async_imports = import_functions.iter().any(|function| function.is_async);
     let raw_imports = import_functions
         .iter()
         .map(render_guest_raw_import)
@@ -256,6 +270,22 @@ fn render_guest_source(import_functions: &FunctionList, export_functions: &Funct
         .map(render_guest_export_wrapper)
         .collect::<Vec<_>>()
         .join("\n\n");
+    let operation_raw_imports = has_async_imports
+        .then(render_guest_operation_raw_imports)
+        .unwrap_or_default();
+    let operation_support = has_async_imports
+        .then(render_guest_operation_support)
+        .unwrap_or_default();
+    let import_uses = if has_async_imports {
+        "raw_imports, AbiError, PendingOperation"
+    } else {
+        "raw_imports, AbiError"
+    };
+    let operation_error_variants = if has_async_imports {
+        "            InvalidOperationState(i32),\n            OperationCancelled,\n"
+    } else {
+        ""
+    };
     format!(
         "// Generated scalar Core Wasm guest bindings for `{ABI_NAMESPACE}`.\n\
          // The public API uses semantic Rust scalar types; raw ABI values stay private.\n\n\
@@ -264,6 +294,7 @@ fn render_guest_source(import_functions: &FunctionList, export_functions: &Funct
          pub enum AbiError {{\n\
          \u{20}   InvalidBoolean(i32),\n\
          \u{20}   OutOfRange {{ ty: &'static str, value: i32 }},\n\
+         {operation_error_variants}\
          }}\n\n\
          #[derive(Clone, Debug, Eq, PartialEq)]\n\
          pub enum ExportInstallError {{\n\
@@ -295,10 +326,12 @@ fn render_guest_source(import_functions: &FunctionList, export_functions: &Funct
          \u{20}   #[link(wasm_import_module = \"{ABI_NAMESPACE}\")]\n\
          \u{20}   extern \"C\" {{\n\
          {raw_imports}\n\
+         {operation_raw_imports}\n\
          \u{20}   }}\n\
          }}\n\n\
+         {operation_support}\n\
          pub mod imports {{\n\
-         \u{20}   use super::{{raw_imports, AbiError}};\n\n\
+         \u{20}   use super::{{{import_uses}}};\n\n\
          {imports}\n\
          }}\n\n\
          pub struct KernalApiV1Exports {{\n\
@@ -318,7 +351,11 @@ fn render_guest_raw_import(function: &Function) -> String {
         function.name,
         raw_import_name(function),
         render_abi_arguments(function),
-        render_abi_result(function)
+        if function.is_async {
+            " -> i64".to_owned()
+        } else {
+            render_abi_result(function)
+        }
     )
 }
 
@@ -333,6 +370,15 @@ fn render_guest_typed_import(function: &Function) -> String {
         "unsafe {{ raw_imports::{}({call_arguments}) }}",
         raw_import_name(function)
     );
+    if function.is_async {
+        return format!(
+            "    pub fn {}({}) -> Result<PendingOperation<{}>, AbiError> {{\n        let operation = {call};\n        Ok(PendingOperation::new(operation as u64, {}))\n    }}",
+            function.name,
+            render_semantic_arguments(function),
+            semantic_return(function),
+            render_operation_result_decoder(function),
+        );
+    }
     let body = match function
         .return_type
         .as_ref()
@@ -350,6 +396,16 @@ fn render_guest_typed_import(function: &Function) -> String {
         render_semantic_arguments(function),
         semantic_return(function)
     )
+}
+
+fn render_guest_operation_raw_imports() -> String {
+    "        #[link_name = \"poll_operation\"]\n        pub(super) fn __kernal_api_v1_import_poll_operation(operation: i64) -> i32;\n        #[link_name = \"take_operation_result\"]\n        pub(super) fn __kernal_api_v1_import_take_operation_result(operation: i64) -> i64;\n        #[link_name = \"yield_operation\"]\n        pub(super) fn __kernal_api_v1_import_yield_operation(operation: i64);\n        #[link_name = \"cancel_operation\"]\n        pub(super) fn __kernal_api_v1_import_cancel_operation(operation: i64);\n"
+        .to_owned()
+}
+
+fn render_guest_operation_support() -> String {
+    "pub struct PendingOperation<T> {\n    operation: Option<u64>,\n    decode: fn(i64) -> Result<T, AbiError>,\n}\n\nimpl<T> PendingOperation<T> {\n    fn new(operation: u64, decode: fn(i64) -> Result<T, AbiError>) -> Self { Self { operation: Some(operation), decode } }\n\n    pub fn poll(&mut self) -> Result<Option<T>, AbiError> {\n        let operation = self.operation.ok_or(AbiError::OperationCancelled)?;\n        match unsafe { raw_imports::__kernal_api_v1_import_poll_operation(operation as i64) } {\n            0 => Ok(None),\n            1 => {\n                self.operation = None;\n                (self.decode)(unsafe { raw_imports::__kernal_api_v1_import_take_operation_result(operation as i64) }).map(Some)\n            }\n            2 => { self.operation = None; Err(AbiError::OperationCancelled) }\n            state => Err(AbiError::InvalidOperationState(state)),\n        }\n    }\n\n    pub fn yield_now(&self) -> Result<(), AbiError> {\n        let operation = self.operation.ok_or(AbiError::OperationCancelled)?;\n        unsafe { raw_imports::__kernal_api_v1_import_yield_operation(operation as i64) };\n        Ok(())\n    }\n\n    pub fn cancel(&mut self) -> Result<(), AbiError> {\n        let operation = self.operation.take().ok_or(AbiError::OperationCancelled)?;\n        unsafe { raw_imports::__kernal_api_v1_import_cancel_operation(operation as i64) };\n        Ok(())\n    }\n}\n\nimpl<T> Drop for PendingOperation<T> {\n    fn drop(&mut self) {\n        if let Some(operation) = self.operation.take() {\n            unsafe { raw_imports::__kernal_api_v1_import_cancel_operation(operation as i64) };\n        }\n    }\n}\n\n"
+        .to_owned()
 }
 
 fn render_guest_export_field(function: &Function) -> String {
@@ -401,6 +457,7 @@ fn render_guest_export_wrapper(function: &Function) -> String {
 }
 
 fn render_host_linker(import_functions: &FunctionList, export_functions: &FunctionList) -> String {
+    let has_async_imports = import_functions.iter().any(|function| function.is_async);
     let helpers = render_host_helpers(import_functions, export_functions);
     let trait_methods = import_functions
         .iter()
@@ -412,6 +469,12 @@ fn render_host_linker(import_functions: &FunctionList, export_functions: &Functi
         .map(render_host_registration)
         .collect::<Vec<_>>()
         .join("\n");
+    let operation_trait_methods = has_async_imports
+        .then(render_host_operation_trait_methods)
+        .unwrap_or_default();
+    let operation_registrations = has_async_imports
+        .then(render_host_operation_registrations)
+        .unwrap_or_default();
     let invocations = export_functions
         .iter()
         .map(render_host_invocation)
@@ -421,11 +484,11 @@ fn render_host_linker(import_functions: &FunctionList, export_functions: &Functi
         "// Generated private Wasmtime 45 glue for scalar Core Wasm ABI `{ABI_NAMESPACE}`.\n\
          // Host trait and invocation helpers use semantic Rust scalar types.\n\n\
          {helpers}\n\n\
-         pub(crate) trait KernalApiV1Imports {{\n{trait_methods}\n}}\n\n\
+         pub(crate) trait KernalApiV1Imports {{\n{trait_methods}\n{operation_trait_methods}}}\n\n\
          pub(crate) fn link_kernal_api_v1<T>(linker: &mut wasmtime::Linker<T>) -> wasmtime::Result<()>\n\
          where\n\
          \u{20}   T: KernalApiV1Imports + Send + 'static,\n\
-         {{\n{registrations}\n    Ok(())\n}}\n\n\
+         {{\n{registrations}\n{operation_registrations}    Ok(())\n}}\n\n\
          {invocations}\n"
     )
 }
@@ -441,6 +504,9 @@ fn render_host_helpers(import_functions: &FunctionList, export_functions: &Funct
                 used.insert(lowered.semantic);
             }
         }
+    }
+    if import_functions.iter().any(|function| function.is_async) {
+        used.insert("u64");
     }
     [
         "bool", "i8", "i16", "i32", "u8", "u16", "u32", "i64", "u64", "f32", "f64",
@@ -479,8 +545,17 @@ fn render_host_trait_method(function: &Function) -> String {
     format!(
         "    fn {}(&mut self{arguments}) -> wasmtime::Result<{}>;",
         function.name,
-        semantic_return(function)
+        if function.is_async {
+            "u64"
+        } else {
+            semantic_return(function)
+        }
     )
+}
+
+fn render_host_operation_trait_methods() -> String {
+    "    fn poll_operation(&mut self, operation: u64) -> wasmtime::Result<i32>;\n    fn take_operation_result(&mut self, operation: u64) -> wasmtime::Result<i64>;\n    fn yield_operation(&mut self, operation: u64) -> wasmtime::Result<()>;\n    fn cancel_operation(&mut self, operation: u64) -> wasmtime::Result<()>;\n"
+        .to_owned()
 }
 
 fn render_host_registration(function: &Function) -> String {
@@ -507,20 +582,24 @@ fn render_host_registration(function: &Function) -> String {
         .map(|argument| argument.name.as_str())
         .collect::<Vec<_>>()
         .join(", ");
-    let result = match function
-        .return_type
-        .as_ref()
-        .and_then(lower_return_type_unchecked)
-    {
-        Some(lowered) => format!(
-            "Ok({}(caller.data_mut().{}({names})?))",
-            encode_function(lowered),
-            function.name
-        ),
-        None => format!(
-            "caller.data_mut().{}({names})?;\n            Ok(())",
-            function.name
-        ),
+    let result = if function.is_async {
+        format!("Ok(caller.data_mut().{}({names})? as i64)", function.name)
+    } else {
+        match function
+            .return_type
+            .as_ref()
+            .and_then(lower_return_type_unchecked)
+        {
+            Some(lowered) => format!(
+                "Ok({}(caller.data_mut().{}({names})?))",
+                encode_function(lowered),
+                function.name
+            ),
+            None => format!(
+                "caller.data_mut().{}({names})?;\n            Ok(())",
+                function.name
+            ),
+        }
     };
     let abi_arguments = render_abi_arguments(function);
     let abi_arguments = if abi_arguments.is_empty() {
@@ -531,7 +610,7 @@ fn render_host_registration(function: &Function) -> String {
     let closure = if abi_arguments.is_empty() {
         format!(
             "|mut caller: wasmtime::Caller<'_, T>| -> wasmtime::Result<{}> {{\n            {result}\n        }}",
-            render_abi_result_only(function)
+            if function.is_async { "i64" } else { render_abi_result_only(function) }
         )
     } else {
         let arguments = abi_arguments
@@ -539,12 +618,18 @@ fn render_host_registration(function: &Function) -> String {
             .replace(", ", ",\n         ");
         format!(
             "|mut caller: wasmtime::Caller<'_, T>,\n         {arguments}|\n         -> wasmtime::Result<{}> {{\n            {decoded}{result}\n        }}",
-            render_abi_result_only(function)
+            if function.is_async { "i64" } else { render_abi_result_only(function) }
         )
     };
     format!(
         "    linker.func_wrap(\n        \"{ABI_NAMESPACE}\",\n        \"{}\",\n        {closure},\n    )?;",
         function.name
+    )
+}
+
+fn render_host_operation_registrations() -> String {
+    format!(
+        "    linker.func_wrap(\n        \"{ABI_NAMESPACE}\",\n        \"poll_operation\",\n        |mut caller: wasmtime::Caller<'_, T>, operation: i64| -> wasmtime::Result<i32> {{\n            caller.data_mut().poll_operation(operation as u64)\n        }},\n    )?;\n    linker.func_wrap(\n        \"{ABI_NAMESPACE}\",\n        \"take_operation_result\",\n        |mut caller: wasmtime::Caller<'_, T>, operation: i64| -> wasmtime::Result<i64> {{\n            caller.data_mut().take_operation_result(operation as u64)\n        }},\n    )?;\n    linker.func_wrap(\n        \"{ABI_NAMESPACE}\",\n        \"yield_operation\",\n        |mut caller: wasmtime::Caller<'_, T>, operation: i64| -> wasmtime::Result<()> {{\n            caller.data_mut().yield_operation(operation as u64)\n        }},\n    )?;\n    linker.func_wrap(\n        \"{ABI_NAMESPACE}\",\n        \"cancel_operation\",\n        |mut caller: wasmtime::Caller<'_, T>, operation: i64| -> wasmtime::Result<()> {{\n            caller.data_mut().cancel_operation(operation as u64)\n        }},\n    )?;\n"
     )
 }
 
@@ -585,9 +670,34 @@ fn render_manifest(import_functions: &FunctionList, export_functions: &FunctionL
         .map(|function| render_manifest_record("exports", "host-to-guest", function))
         .collect::<Vec<_>>()
         .join("\n");
+    let operation_controls = if import_functions.iter().any(|function| function.is_async) {
+        format!("\n{}", render_operation_control_manifest_records())
+    } else {
+        "\n".to_owned()
+    };
     format!(
-        "schema = \"{SCHEMA}\"\nschema_revision = {SCHEMA_REVISION}\ngenerator_revision = {GENERATOR_REVISION}\nabi_version = {ABI_VERSION}\nnamespace = \"{ABI_NAMESPACE}\"\n\n{imports}\n{exports}"
+        "schema = \"{SCHEMA}\"\nschema_revision = {SCHEMA_REVISION}\ngenerator_revision = {GENERATOR_REVISION}\nabi_version = {ABI_VERSION}\nnamespace = \"{ABI_NAMESPACE}\"\n\n{imports}{operation_controls}{exports}"
     )
+}
+
+fn render_operation_control_manifest_records() -> String {
+    [
+        ("poll_operation", "i32"),
+        ("take_operation_result", "i64"),
+        ("yield_operation", "unit"),
+        ("cancel_operation", "unit"),
+    ]
+    .iter()
+    .map(|(name, result)| {
+        let result = match *result {
+            "i32" => "{ semantic = \"i32\", abi = \"i32\" }",
+            "i64" => "{ semantic = \"i64\", abi = \"i64\" }",
+            "unit" => "{ semantic = \"()\", abi = \"unit\" }",
+            _ => unreachable!("closed operation control table"),
+        };
+        format!("[[imports]]\nnamespace = \"{ABI_NAMESPACE}\"\nname = \"{name}\"\ndirection = \"guest-to-host\"\ngenerated = true\nparams = [{{ semantic = \"u64\", abi = \"i64\" }}]\nresults = [{result}]\n\n")
+    })
+    .collect()
 }
 
 fn render_manifest_record(table: &str, direction: &str, function: &Function) -> String {
@@ -603,21 +713,65 @@ fn render_manifest_record(table: &str, direction: &str, function: &Function) -> 
         })
         .collect::<Vec<_>>()
         .join(", ");
-    let results = function
+    let results = if function.is_async {
+        "{ semantic = \"operation\", abi = \"i64\" }".to_owned()
+    } else {
+        function
+            .return_type
+            .as_ref()
+            .and_then(lower_return_type_unchecked)
+            .map(|lowered| {
+                format!(
+                    "{{ semantic = \"{}\", abi = \"{}\" }}",
+                    lowered.semantic, lowered.abi
+                )
+            })
+            .unwrap_or_else(|| "{ semantic = \"()\", abi = \"unit\" }".to_owned())
+    };
+    let operation = if function.is_async {
+        let result = function
+            .return_type
+            .as_ref()
+            .and_then(lower_return_type_unchecked)
+            .map(|lowered| {
+                format!(
+                    "{{ semantic = \"{}\", abi = \"{}\" }}",
+                    lowered.semantic, lowered.abi
+                )
+            })
+            .unwrap_or_else(|| "{ semantic = \"()\", abi = \"unit\" }".to_owned());
+        format!("async = true\noperation_result = {result}\n")
+    } else {
+        String::new()
+    };
+    format!(
+        "[[{table}]]\nnamespace = \"{ABI_NAMESPACE}\"\nname = \"{}\"\ndirection = \"{direction}\"\nparams = [{params}]\nresults = [{results}]\n{operation}",
+        function.name
+    )
+}
+
+fn render_operation_result_decoder(function: &Function) -> String {
+    match function
         .return_type
         .as_ref()
         .and_then(lower_return_type_unchecked)
-        .map(|lowered| {
-            format!(
-                "{{ semantic = \"{}\", abi = \"{}\" }}",
-                lowered.semantic, lowered.abi
-            )
-        })
-        .unwrap_or_else(|| "{ semantic = \"()\", abi = \"unit\" }".to_owned());
-    format!(
-        "[[{table}]]\nnamespace = \"{ABI_NAMESPACE}\"\nname = \"{}\"\ndirection = \"{direction}\"\nparams = [{params}]\nresults = [{results}]\n",
-        function.name
-    )
+    {
+        Some(lowered) => match lowered.semantic {
+            "bool" => "|raw| super::bool_from_i32(raw as i32)".to_owned(),
+            "i8" => "|raw| super::i8_from_i32(raw as i32)".to_owned(),
+            "i16" => "|raw| super::i16_from_i32(raw as i32)".to_owned(),
+            "i32" => "|raw| super::i32_from_i32(raw as i32)".to_owned(),
+            "u8" => "|raw| super::u8_from_i32(raw as i32)".to_owned(),
+            "u16" => "|raw| super::u16_from_i32(raw as i32)".to_owned(),
+            "u32" => "|raw| super::u32_from_i32(raw as i32)".to_owned(),
+            "i64" => "|raw| super::i64_from_i64(raw)".to_owned(),
+            "u64" => "|raw| super::u64_from_i64(raw)".to_owned(),
+            "f32" => "|raw| super::f32_from_f32(f32::from_bits(raw as u32))".to_owned(),
+            "f64" => "|raw| super::f64_from_f64(f64::from_bits(raw as u64))".to_owned(),
+            _ => unreachable!("closed lowering table"),
+        },
+        None => "|_| Ok(())".to_owned(),
+    }
 }
 
 fn raw_import_name(function: &Function) -> String {
@@ -775,6 +929,7 @@ mod tests {
             .host_linker
             .contains("T: KernalApiV1Imports + Send + 'static"));
         assert!(rendered.host_linker.contains("invoke_guest_value"));
+        assert!(!rendered.guest_source.contains("OperationCancelled"));
         for legacy in ["FatPtr", "MessagePack", "Wasmer", "Tokio", "rmp"] {
             assert!(!rendered.guest_source.contains(legacy));
             assert!(!rendered.host_linker.contains(legacy));
@@ -853,7 +1008,7 @@ results = [{ semantic = "f64", abi = "f64" }]
     }
 
     #[test]
-    fn non_scalar_and_async_values_are_rejected_before_output() {
+    fn non_scalar_async_export_and_reserved_values_are_rejected_before_output() {
         for declaration in [
             "fn takes_string(value: String);",
             "fn takes_array(value: [u8; 4]);",
@@ -873,6 +1028,12 @@ results = [{ semantic = "f64", abi = "f64" }]
         assert!(matches!(
             render_bindings(&FunctionList::new(), &async_exports, &TypeMap::new()),
             Err(WasmtimeCoreWasmError::AsyncFunction { .. })
+        ));
+        let mut reserved_imports = FunctionList::new();
+        reserved_imports.add_function("fn poll_operation();");
+        assert!(matches!(
+            render_bindings(&reserved_imports, &FunctionList::new(), &TypeMap::new()),
+            Err(WasmtimeCoreWasmError::ReservedOperationControl { .. })
         ));
     }
 

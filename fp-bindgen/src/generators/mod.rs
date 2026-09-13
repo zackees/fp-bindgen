@@ -319,12 +319,16 @@ impl TsRuntimeConfig {}
 
 /// A validation or filesystem error from the scalar Wasmtime Core Wasm generator.
 ///
-/// This generator intentionally rejects every value that would require the legacy
-/// allocation, serialization, or async protocol before it creates an output directory.
+/// This generator rejects bulk values and async exports before it creates an output
+/// directory. Async scalar imports use the explicit operation-handle protocol.
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum WasmtimeCoreWasmError {
     AsyncFunction {
+        direction: &'static str,
+        function: String,
+    },
+    ReservedOperationControl {
         direction: &'static str,
         function: String,
     },
@@ -352,7 +356,14 @@ impl Display for WasmtimeCoreWasmError {
                 function,
             } => write!(
                 f,
-                "{direction} function `{function}` is async; the Wasmtime Core Wasm v0 ABI is synchronous"
+                "{direction} function `{function}` is async; the Wasmtime Core Wasm v0 ABI supports async scalar imports only"
+            ),
+            Self::ReservedOperationControl {
+                direction,
+                function,
+            } => write!(
+                f,
+                "{direction} function `{function}` conflicts with a reserved Wasmtime Core Wasm operation control"
             ),
             Self::UnsupportedValue {
                 direction,
