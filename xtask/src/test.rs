@@ -39,7 +39,7 @@ pub fn test() -> TaskResult<()> {
                 }
             };
             check_target("wasm32-unknown-unknown")?;
-            check_target("wasm32-wasi")?;
+            check_target("wasm32-wasip1")?;
         }
         None => {
             progress.report(WARN, &style("Could not find rustup, so we cannot determine if the appropriate targets are installed.").yellow().to_string());
