@@ -22,21 +22,36 @@ struct StreamHost {
     writes: Vec<(u64, Vec<u8>)>,
     reads: usize,
     closes: Vec<u64>,
+    reject_transfers: bool,
 }
 
 #[cfg(feature = "wasmtime45-integration")]
 impl generated_stream::KernalApiV1Imports for StreamHost {
-    fn stream_read(&mut self, stream: u64, destination: &mut [u8]) -> wasmtime::Result<usize> {
+    fn stream_read(
+        &mut self,
+        stream: u64,
+        destination: &mut [u8],
+    ) -> wasmtime::Result<generated_stream::StreamTransfer> {
+        if self.reject_transfers {
+            return Ok(generated_stream::StreamTransfer::Rejected);
+        }
         assert_eq!(stream, 7);
         assert_eq!(destination.len(), 4);
         destination.copy_from_slice(b"pong");
         self.reads += 1;
-        Ok(4)
+        Ok(generated_stream::StreamTransfer::Transferred(4))
     }
 
-    fn stream_write(&mut self, stream: u64, source: &[u8]) -> wasmtime::Result<usize> {
+    fn stream_write(
+        &mut self,
+        stream: u64,
+        source: &[u8],
+    ) -> wasmtime::Result<generated_stream::StreamTransfer> {
+        if self.reject_transfers {
+            return Ok(generated_stream::StreamTransfer::Rejected);
+        }
         self.writes.push((stream, source.to_vec()));
-        Ok(source.len())
+        Ok(generated_stream::StreamTransfer::Transferred(source.len()))
     }
 
     fn stream_close(&mut self, stream: u64) -> wasmtime::Result<i32> {
@@ -88,6 +103,12 @@ fn generated_stream_controls_copy_only_a_bounded_caller_memory_chunk() {
     assert_eq!(store.data().writes, vec![(7, b"ping".to_vec())]);
     assert_eq!(store.data().reads, 1);
     assert_eq!(store.data().closes, vec![7]);
+
+    store.data_mut().reject_transfers = true;
+    let rejected_read = instance
+        .get_typed_func::<(), i32>(&mut store, "read")
+        .unwrap();
+    assert_eq!(rejected_read.call(&mut store, ()).unwrap(), -1);
 
     let invalid_read = instance
         .get_typed_func::<(), i32>(&mut store, "invalid_read")

@@ -14,6 +14,9 @@ pub(crate) mod resources {
  }
 
 
+/// A stream transfer either made bounded progress or was rejected without trapping the guest.
+pub(crate) enum StreamTransfer { Transferred(usize), Rejected }
+
 enum CallerMemory {
     Ordinary(wasmtime::Memory),
     Shared(wasmtime::SharedMemory),
@@ -74,10 +77,10 @@ fn checked_stream_count(transferred: usize, requested: usize) -> wasmtime::Resul
 
 pub(crate) trait KernalApiV1Imports {
 
-    /// Transfer one bounded caller-memory chunk. The host registry validates the raw stream handle.
-    fn stream_read(&mut self, stream: u64, destination: &mut [u8]) -> wasmtime::Result<usize>;
-    /// Transfer one bounded caller-memory chunk. The host registry validates the raw stream handle.
-    fn stream_write(&mut self, stream: u64, source: &[u8]) -> wasmtime::Result<usize>;
+    /// Transfer one bounded caller-memory chunk. Return `StreamTransfer::Rejected` for a guest-visible rejection.
+    fn stream_read(&mut self, stream: u64, destination: &mut [u8]) -> wasmtime::Result<StreamTransfer>;
+    /// Transfer one bounded caller-memory chunk. Return `StreamTransfer::Rejected` for a guest-visible rejection.
+    fn stream_write(&mut self, stream: u64, source: &[u8]) -> wasmtime::Result<StreamTransfer>;
     /// Atomically revoke a stream handle through the host's canonical scope/generation registry.
     fn stream_close(&mut self, stream: u64) -> wasmtime::Result<i32>;
 }
@@ -96,7 +99,7 @@ where
             let memory = caller_memory(&mut caller)?;
             checked_guest_memory_range(&memory, &caller, destination, destination_len)?;
             let mut chunk = ::std::vec![0; destination_len];
-            let transferred = caller.data_mut().stream_read(stream as u64, &mut chunk)?;
+            let transferred = match caller.data_mut().stream_read(stream as u64, &mut chunk)? { StreamTransfer::Rejected => return Ok(-1), StreamTransfer::Transferred(transferred) => transferred };
             checked_stream_count(transferred, destination_len)?;
             memory.write(&mut caller, destination, &chunk[..transferred])?;
             Ok(transferred as i32)
@@ -112,7 +115,7 @@ where
             checked_guest_memory_range(&memory, &caller, source, source_len)?;
             let mut chunk = ::std::vec![0; source_len];
             memory.read(&caller, source, &mut chunk)?;
-            let transferred = caller.data_mut().stream_write(stream as u64, &chunk)?;
+            let transferred = match caller.data_mut().stream_write(stream as u64, &chunk)? { StreamTransfer::Rejected => return Ok(-1), StreamTransfer::Transferred(transferred) => transferred };
             checked_stream_count(transferred, source_len)?;
             Ok(transferred as i32)
         },
