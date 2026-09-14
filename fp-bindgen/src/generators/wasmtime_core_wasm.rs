@@ -169,7 +169,12 @@ fn owned_resource_release_names(types: &TypeMap) -> BTreeSet<String> {
     types
         .values()
         .filter_map(|ty| match ty {
-            Type::Resource(resource) if resource.is_owned() => {
+            // Streams have one generic close control.  Their nominal guest
+            // types still own the handle, but type-specific release imports
+            // would needlessly create another lifecycle ABI.
+            Type::Resource(resource)
+                if resource.ownership == crate::types::ResourceOwnership::Owned =>
+            {
                 Some(resource_release_import_name(resource))
             }
             _ => None,
@@ -180,7 +185,11 @@ fn owned_resource_release_names(types: &TypeMap) -> BTreeSet<String> {
 fn validate_owned_resource_release_names(types: &TypeMap) -> Result<(), WasmtimeCoreWasmError> {
     let mut releases = std::collections::BTreeMap::new();
     for resource in types.values().filter_map(|ty| match ty {
-        Type::Resource(resource) if resource.is_owned() => Some(resource),
+        Type::Resource(resource)
+            if resource.ownership == crate::types::ResourceOwnership::Owned =>
+        {
+            Some(resource)
+        }
         _ => None,
     }) {
         let release = resource_release_import_name(resource);
@@ -348,6 +357,9 @@ fn render_guest_source(
     types: &TypeMap,
 ) -> String {
     let has_async_imports = import_functions.iter().any(|function| function.is_async);
+    let has_streams = types
+        .values()
+        .any(|ty| matches!(ty, Type::Resource(resource) if resource.is_stream()));
     let has_async_owned_borrow = import_functions.iter().any(|function| {
         function.is_async
             && function
@@ -382,6 +394,9 @@ fn render_guest_source(
         .then(|| render_guest_operation_support(has_async_owned_borrow))
         .unwrap_or_default();
     let resource_release_raw_imports = render_guest_resource_release_raw_imports(types);
+    let stream_control_raw_imports = has_streams
+        .then(render_guest_stream_control_raw_imports)
+        .unwrap_or_default();
     let mut import_uses = if has_async_imports {
         "raw_imports, AbiError, PendingOperation"
     } else {
@@ -396,6 +411,18 @@ fn render_guest_source(
     } else {
         ""
     };
+    let stream_error_variants = if has_streams {
+        "            StreamChunkTooLarge { requested: usize, maximum: usize },\n            StreamInvalidCount { transferred: i32, requested: usize },\n"
+    } else {
+        ""
+    };
+    let stream_support = if has_streams {
+        format!(
+            "const MAX_STREAM_CHUNK_BYTES: usize = {MAX_STREAM_CHUNK_BYTES}usize;\nfn check_stream_chunk(requested: usize) -> Result<(), AbiError> {{ if requested <= MAX_STREAM_CHUNK_BYTES {{ Ok(()) }} else {{ Err(AbiError::StreamChunkTooLarge {{ requested, maximum: MAX_STREAM_CHUNK_BYTES }}) }} }}\nfn stream_count_from_i32(transferred: i32, requested: usize) -> Result<usize, AbiError> {{ let transferred = usize::try_from(transferred).map_err(|_| AbiError::StreamInvalidCount {{ transferred, requested }})?; if transferred <= requested {{ Ok(transferred) }} else {{ Err(AbiError::StreamInvalidCount {{ transferred: transferred as i32, requested }}) }} }}\n\n"
+        )
+    } else {
+        String::new()
+    };
     let resources = render_guest_resource_types(types);
     format!(
         "// Generated Core Wasm guest bindings for `{ABI_NAMESPACE}`.\n\
@@ -407,7 +434,7 @@ fn render_guest_source(
          \u{20}   OutOfRange {{ ty: &'static str, value: i32 }},\n\
          \u{20}   ResourceClosed {{ resource: &'static str }},\n\
          \u{20}   ResourceReleaseRejected {{ resource: &'static str, status: i32 }},\n\
-         {operation_error_variants}\
+         {operation_error_variants}{stream_error_variants}\
          }}\n\n\
          #[derive(Clone, Debug, Eq, PartialEq)]\n\
          pub enum ExportInstallError {{\n\
@@ -436,12 +463,14 @@ fn render_guest_source(
          fn u64_to_i64(value: u64) -> i64 {{ value as i64 }}\n\
          fn f32_to_f32(value: f32) -> f32 {{ value }}\n\
          fn f64_to_f64(value: f64) -> f64 {{ value }}\n\n\
+         {stream_support}\
          mod raw_imports {{\n\
          \u{20}   #[link(wasm_import_module = \"{ABI_NAMESPACE}\")]\n\
          \u{20}   extern \"C\" {{\n\
          {raw_imports}\n\
          {operation_raw_imports}\n\
          {resource_release_raw_imports}\n\
+         {stream_control_raw_imports}\n\
          \u{20}   }}\n\
          }}\n\n\
          {operation_support}\n\
@@ -464,7 +493,16 @@ fn render_guest_resource_types(types: &TypeMap) -> String {
     let definitions = types
         .values()
         .filter_map(|ty| match ty {
-            Type::Resource(resource) if resource.is_owned() => Some(format!(
+            Type::Resource(resource) if resource.is_stream() => Some(format!(
+                "#[derive(Debug, Eq, Hash, PartialEq)]\npub struct {}(::core::option::Option<u64>);\n\nimpl {} {{\n    pub(crate) fn from_abi(raw: u64) -> Self {{ Self(::core::option::Option::Some(raw)) }}\n    pub(crate) fn decode_i64(raw: i64) -> ::core::result::Result<Self, super::AbiError> {{ ::core::result::Result::Ok(Self::from_abi(raw as u64)) }}\n    pub(crate) fn encode_i64(&self) -> ::core::result::Result<i64, super::AbiError> {{ self.0.map(|raw| raw as i64).ok_or(super::AbiError::ResourceClosed {{ resource: \"{}\" }}) }}\n    pub fn read(&mut self, destination: &mut [u8]) -> ::core::result::Result<usize, super::AbiError> {{ let stream = self.encode_i64()?; super::check_stream_chunk(destination.len())?; let transferred = unsafe {{ super::raw_imports::__kernal_api_v1_import_stream_read(stream, destination.as_mut_ptr() as usize as i32, destination.len() as i32) }}; super::stream_count_from_i32(transferred, destination.len()) }}\n    pub fn write(&mut self, source: &[u8]) -> ::core::result::Result<usize, super::AbiError> {{ let stream = self.encode_i64()?; super::check_stream_chunk(source.len())?; let transferred = unsafe {{ super::raw_imports::__kernal_api_v1_import_stream_write(stream, source.as_ptr() as usize as i32, source.len() as i32) }}; super::stream_count_from_i32(transferred, source.len()) }}\n    pub fn close(mut self) -> ::core::result::Result<(), super::AbiError> {{ self.release() }}\n    fn release(&mut self) -> ::core::result::Result<(), super::AbiError> {{ let raw = self.0.take().ok_or(super::AbiError::ResourceClosed {{ resource: \"{}\" }})?; let status = unsafe {{ super::raw_imports::__kernal_api_v1_import_stream_close(raw as i64) }}; if status == 0 {{ ::core::result::Result::Ok(()) }} else {{ ::core::result::Result::Err(super::AbiError::ResourceReleaseRejected {{ resource: \"{}\", status }}) }} }}\n}}\n\nimpl ::core::ops::Drop for {} {{ fn drop(&mut self) {{ if self.0.is_some() {{ let _ = self.release(); }} }} }}\n\n",
+                resource.ident,
+                resource.ident,
+                resource.ident,
+                resource.ident,
+                resource.ident,
+                resource.ident,
+            )),
+            Type::Resource(resource) if resource.ownership == crate::types::ResourceOwnership::Owned => Some(format!(
                 "#[derive(Debug, Eq, Hash, PartialEq)]\npub struct {}(::core::option::Option<u64>);\n\nimpl {} {{\n    pub(crate) fn from_abi(raw: u64) -> Self {{ Self(::core::option::Option::Some(raw)) }}\n    pub(crate) fn decode_i64(raw: i64) -> ::core::result::Result<Self, super::AbiError> {{ ::core::result::Result::Ok(Self::from_abi(raw as u64)) }}\n    pub(crate) fn encode_i64(&self) -> ::core::result::Result<i64, super::AbiError> {{ self.0.map(|raw| raw as i64).ok_or(super::AbiError::ResourceClosed {{ resource: \"{}\" }}) }}\n    pub fn close(mut self) -> ::core::result::Result<(), super::AbiError> {{ self.release() }}\n    fn release(&mut self) -> ::core::result::Result<(), super::AbiError> {{ let raw = self.0.take().ok_or(super::AbiError::ResourceClosed {{ resource: \"{}\" }})?; let status = unsafe {{ super::raw_imports::{}(raw as i64) }}; if status == 0 {{ ::core::result::Result::Ok(()) }} else {{ ::core::result::Result::Err(super::AbiError::ResourceReleaseRejected {{ resource: \"{}\", status }}) }} }}\n}}\n\nimpl ::core::ops::Drop for {} {{ fn drop(&mut self) {{ if self.0.is_some() {{ let _ = self.release(); }} }} }}\n\n",
                 resource.ident,
                 resource.ident,
@@ -504,14 +542,23 @@ fn render_guest_resource_release_raw_imports(types: &TypeMap) -> String {
     types
         .values()
         .filter_map(|ty| match ty {
-            Type::Resource(resource) if resource.is_owned() => Some(format!(
+            Type::Resource(resource)
+                if resource.ownership == crate::types::ResourceOwnership::Owned =>
+            {
+                Some(format!(
                 "        #[link_name = \"{}\"]\n        pub(super) fn {}(resource: i64) -> i32;\n",
                 resource_release_import_name(resource),
                 guest_resource_release_raw_name(resource),
-            )),
+            ))
+            }
             _ => None,
         })
         .collect()
+}
+
+fn render_guest_stream_control_raw_imports() -> String {
+    "        #[link_name = \"stream_read\"]\n        pub(super) fn __kernal_api_v1_import_stream_read(stream: i64, destination: i32, destination_len: i32) -> i32;\n        #[link_name = \"stream_write\"]\n        pub(super) fn __kernal_api_v1_import_stream_write(stream: i64, source: i32, source_len: i32) -> i32;\n        #[link_name = \"stream_close\"]\n        pub(super) fn __kernal_api_v1_import_stream_close(stream: i64) -> i32;\n"
+        .to_owned()
 }
 
 fn render_guest_raw_import(function: &LoweredFunction<'_>) -> String {
@@ -683,7 +730,18 @@ fn render_host_linker(
     types: &TypeMap,
 ) -> String {
     let has_async_imports = import_functions.iter().any(|function| function.is_async);
-    let helpers = render_host_helpers(import_functions, export_functions);
+    let has_streams = types
+        .values()
+        .any(|ty| matches!(ty, Type::Resource(resource) if resource.is_stream()));
+    let helpers = format!(
+        "{}{}",
+        render_host_helpers(import_functions, export_functions),
+        if has_streams {
+            render_host_stream_helpers()
+        } else {
+            String::new()
+        },
+    );
     let trait_methods = import_functions
         .iter()
         .map(render_host_trait_method)
@@ -702,23 +760,51 @@ fn render_host_linker(
         .unwrap_or_default();
     let resource_trait_methods = render_host_resource_release_trait_methods(types);
     let resource_registrations = render_host_resource_release_registrations(types);
+    let stream_trait_methods = has_streams
+        .then(render_host_stream_trait_methods)
+        .unwrap_or_default();
+    let stream_registrations = has_streams
+        .then(render_host_stream_registrations)
+        .unwrap_or_default();
     let invocations = export_functions
         .iter()
         .map(render_host_invocation)
         .collect::<Vec<_>>()
         .join("\n\n");
+    let invocations = if invocations.is_empty() {
+        invocations
+    } else {
+        format!("{invocations}\n")
+    };
     let resources = render_host_resource_types(types);
     format!(
         "// Generated private Wasmtime 45 glue for Core Wasm ABI `{ABI_NAMESPACE}`.\n\
          // Host trait and invocation helpers use semantic scalar and resource types.\n\n\
          {resources}\
          {helpers}\n\n\
-         pub(crate) trait KernalApiV1Imports {{\n{trait_methods}\n{operation_trait_methods}{resource_trait_methods}}}\n\n\
+         pub(crate) trait KernalApiV1Imports {{\n{trait_methods}\n{operation_trait_methods}{resource_trait_methods}{stream_trait_methods}}}\n\n\
          pub(crate) fn link_kernal_api_v1<T>(linker: &mut wasmtime::Linker<T>) -> wasmtime::Result<()>\n\
          where\n\
          \u{20}   T: KernalApiV1Imports + Send + 'static,\n\
-         {{\n{registrations}\n{operation_registrations}{resource_registrations}    Ok(())\n}}\n\n\
-         {invocations}\n"
+         {{\n{registrations}\n{operation_registrations}{resource_registrations}{stream_registrations}    Ok(())\n}}\n\n\
+         {invocations}"
+    )
+}
+
+fn render_host_stream_trait_methods() -> String {
+    "    /// Transfer one bounded caller-memory chunk. The host registry validates the raw stream handle.\n    fn stream_read(&mut self, stream: u64, destination: &mut [u8]) -> wasmtime::Result<usize>;\n    /// Transfer one bounded caller-memory chunk. The host registry validates the raw stream handle.\n    fn stream_write(&mut self, stream: u64, source: &[u8]) -> wasmtime::Result<usize>;\n    /// Atomically revoke a stream handle through the host's canonical scope/generation registry.\n    fn stream_close(&mut self, stream: u64) -> wasmtime::Result<i32>;\n"
+        .to_owned()
+}
+
+fn render_host_stream_registrations() -> String {
+    format!(
+        "    linker.func_wrap(\n        \"{ABI_NAMESPACE}\",\n        \"stream_read\",\n        |mut caller: wasmtime::Caller<'_, T>, stream: i64, destination: i32, destination_len: i32| -> wasmtime::Result<i32> {{\n            let destination_len = bounded_stream_len(destination_len)?;\n            let destination = guest_memory_offset(destination);\n            let memory = caller_memory(&mut caller)?;\n            checked_guest_memory_range(&memory, &caller, destination, destination_len)?;\n            let mut chunk = ::std::vec![0; destination_len];\n            let transferred = caller.data_mut().stream_read(stream as u64, &mut chunk)?;\n            checked_stream_count(transferred, destination_len)?;\n            memory.write(&mut caller, destination, &chunk[..transferred])?;\n            Ok(transferred as i32)\n        }},\n    )?;\n    linker.func_wrap(\n        \"{ABI_NAMESPACE}\",\n        \"stream_write\",\n        |mut caller: wasmtime::Caller<'_, T>, stream: i64, source: i32, source_len: i32| -> wasmtime::Result<i32> {{\n            let source_len = bounded_stream_len(source_len)?;\n            let source = guest_memory_offset(source);\n            let memory = caller_memory(&mut caller)?;\n            checked_guest_memory_range(&memory, &caller, source, source_len)?;\n            let mut chunk = ::std::vec![0; source_len];\n            memory.read(&caller, source, &mut chunk)?;\n            let transferred = caller.data_mut().stream_write(stream as u64, &chunk)?;\n            checked_stream_count(transferred, source_len)?;\n            Ok(transferred as i32)\n        }},\n    )?;\n    linker.func_wrap(\n        \"{ABI_NAMESPACE}\",\n        \"stream_close\",\n        |mut caller: wasmtime::Caller<'_, T>, stream: i64| -> wasmtime::Result<i32> {{\n            caller.data_mut().stream_close(stream as u64)\n        }},\n    )?;\n"
+    )
+}
+
+fn render_host_stream_helpers() -> String {
+    format!(
+        "\nfn bounded_stream_len(value: i32) -> wasmtime::Result<usize> {{\n    let value = usize::try_from(value).map_err(|_| wasmtime::Error::msg(\"negative stream chunk length\"))?;\n    if value <= {MAX_STREAM_CHUNK_BYTES}usize {{ Ok(value) }} else {{ Err(wasmtime::Error::msg(format!(\"stream chunk exceeds {MAX_STREAM_CHUNK_BYTES} bytes: {{value}}\"))) }}\n}}\nfn guest_memory_offset(value: i32) -> usize {{ value as u32 as usize }}\nfn caller_memory<T>(caller: &mut wasmtime::Caller<'_, T>) -> wasmtime::Result<wasmtime::Memory> {{\n    caller.get_export(\"memory\").and_then(|export| export.into_memory()).ok_or_else(|| wasmtime::Error::msg(\"stream controls require exported guest memory named `memory`\"))\n}}\nfn checked_guest_memory_range<T>(memory: &wasmtime::Memory, caller: &wasmtime::Caller<'_, T>, offset: usize, length: usize) -> wasmtime::Result<()> {{\n    let end = offset.checked_add(length).ok_or_else(|| wasmtime::Error::msg(\"stream guest-memory range overflow\"))?;\n    if end <= memory.data_size(caller) {{ Ok(()) }} else {{ Err(wasmtime::Error::msg(\"stream guest-memory range is out of bounds\")) }}\n}}\nfn checked_stream_count(transferred: usize, requested: usize) -> wasmtime::Result<()> {{\n    if transferred <= requested && transferred <= {MAX_STREAM_CHUNK_BYTES}usize {{ Ok(()) }} else {{ Err(wasmtime::Error::msg(format!(\"host returned invalid stream count {{transferred}} for requested {{requested}}\"))) }}\n}}\n"
     )
 }
 
@@ -726,7 +812,7 @@ fn render_host_resource_release_trait_methods(types: &TypeMap) -> String {
     types
         .values()
         .filter_map(|ty| match ty {
-            Type::Resource(resource) if resource.is_owned() => Some(format!(
+            Type::Resource(resource) if resource.ownership == crate::types::ResourceOwnership::Owned => Some(format!(
                 "    /// Atomically revoke this guest-owned handle through the host's canonical scope/generation registry.\n    fn {}(&mut self, resource: resources::{}) -> wasmtime::Result<i32>;\n",
                 resource_release_import_name(resource), resource.ident
             )),
@@ -739,7 +825,7 @@ fn render_host_resource_release_registrations(types: &TypeMap) -> String {
     types
         .values()
         .filter_map(|ty| match ty {
-            Type::Resource(resource) if resource.is_owned() => Some(format!(
+            Type::Resource(resource) if resource.ownership == crate::types::ResourceOwnership::Owned => Some(format!(
                 "    linker.func_wrap(\n        \"{ABI_NAMESPACE}\",\n        \"{}\",\n        |mut caller: wasmtime::Caller<'_, T>, resource: i64| -> wasmtime::Result<i32> {{\n            caller.data_mut().{}(resources::{}::decode_i64(resource)?)\n        }},\n    )?;\n",
                 resource_release_import_name(resource),
                 resource_release_import_name(resource),
@@ -991,7 +1077,11 @@ fn render_manifest(
     } else {
         "\n".to_owned()
     };
-    let resource_controls = render_resource_release_manifest_records(types);
+    let resource_controls = format!(
+        "{}{}",
+        render_resource_release_manifest_records(types),
+        render_stream_control_manifest_records(types),
+    );
     format!(
         "schema = \"{SCHEMA}\"\nschema_revision = {SCHEMA_REVISION}\ngenerator_revision = {GENERATOR_REVISION}\nabi_version = {ABI_VERSION}\nnamespace = \"{ABI_NAMESPACE}\"\n\n{resources}{imports}{operation_controls}{resource_controls}{exports}"
     )
@@ -1001,13 +1091,32 @@ fn render_resource_release_manifest_records(types: &TypeMap) -> String {
     types
         .values()
         .filter_map(|ty| match ty {
-            Type::Resource(resource) if resource.is_owned() => Some(format!(
+            Type::Resource(resource) if resource.ownership == crate::types::ResourceOwnership::Owned => Some(format!(
                 "[[imports]]\nnamespace = \"{ABI_NAMESPACE}\"\nname = \"{}\"\ndirection = \"guest-to-host\"\ngenerated = true\nresource_control = \"release\"\nparams = [{{ semantic = \"{}\", abi = \"i64\", kind = \"resource\" }}]\nresults = [{{ semantic = \"i32\", abi = \"i32\" }}]\n\n",
                 resource_release_import_name(resource), resource.ident
             )),
             _ => None,
         })
         .collect()
+}
+
+fn render_stream_control_manifest_records(types: &TypeMap) -> String {
+    if !types
+        .values()
+        .any(|ty| matches!(ty, Type::Resource(resource) if resource.is_stream()))
+    {
+        return String::new();
+    }
+    [
+        ("stream_read", "transfer_read", "[{ semantic = \"stream\", abi = \"i64\", kind = \"resource\" }, { semantic = \"guest_ptr\", abi = \"i32\" }, { semantic = \"chunk_len\", abi = \"i32\" }]"),
+        ("stream_write", "transfer_write", "[{ semantic = \"stream\", abi = \"i64\", kind = \"resource\" }, { semantic = \"guest_ptr\", abi = \"i32\" }, { semantic = \"chunk_len\", abi = \"i32\" }]"),
+        ("stream_close", "close", "[{ semantic = \"stream\", abi = \"i64\", kind = \"resource\" }]"),
+    ]
+    .iter()
+    .map(|(name, control, params)| format!(
+        "[[imports]]\nnamespace = \"{ABI_NAMESPACE}\"\nname = \"{name}\"\ndirection = \"guest-to-host\"\ngenerated = true\nresource_control = \"{control}\"\nmax_chunk_bytes = {MAX_STREAM_CHUNK_BYTES}\nparams = {params}\nresults = [{{ semantic = \"i32\", abi = \"i32\" }}]\n\n"
+    ))
+    .collect()
 }
 
 fn render_operation_control_manifest_records() -> String {
@@ -1246,6 +1355,9 @@ mod tests {
         );
         let rendered = render_bindings(&FunctionList::new(), &FunctionList::new(), &types).unwrap();
 
+        syn::parse_file(&rendered.guest_source).unwrap();
+        syn::parse_file(&rendered.host_linker).unwrap();
+
         assert!(rendered.guest_source.contains("pub mod resources {"));
         assert!(rendered.guest_source.contains("pub struct Archive(u64);"));
         assert!(rendered
@@ -1296,7 +1408,8 @@ mod tests {
         assert!(rendered
             .guest_source
             .contains("pub struct Input(::core::option::Option<u64>)"));
-        assert!(rendered.guest_source.contains("resource_release_input"));
+        assert!(rendered.guest_source.contains("stream_close"));
+        assert!(!rendered.guest_source.contains("resource_release_input"));
         let manifest: toml::Value = rendered.manifest.parse().unwrap();
         assert_eq!(
             manifest["resources"][0]["ownership"].as_str(),
@@ -1304,6 +1417,65 @@ mod tests {
         );
         assert!(!rendered.guest_source.contains("Vec<u8>"));
         assert!(!rendered.host_linker.contains("MessagePack"));
+    }
+
+    #[test]
+    fn stream_controls_transfer_only_bounded_caller_memory_slices() {
+        let mut types = TypeMap::new();
+        types.insert(
+            TypeIdent::from("Input"),
+            Type::Resource(crate::types::Resource::stream("Input")),
+        );
+        let rendered = render_bindings(&FunctionList::new(), &FunctionList::new(), &types).unwrap();
+        syn::parse_file(&rendered.guest_source).unwrap();
+        syn::parse_file(&rendered.host_linker).unwrap();
+        let manifest: toml::Value = rendered.manifest.parse().unwrap();
+
+        assert!(rendered
+            .guest_source
+            .contains("pub fn read(&mut self, destination: &mut [u8]) -> ::core::result::Result<usize, super::AbiError>"));
+        assert!(rendered
+            .guest_source
+            .contains("pub fn write(&mut self, source: &[u8]) -> ::core::result::Result<usize, super::AbiError>"));
+        assert!(rendered.guest_source.contains("StreamChunkTooLarge"));
+        assert!(rendered
+            .host_linker
+            .contains("fn stream_read(&mut self, stream: u64, destination: &mut [u8]) -> wasmtime::Result<usize>;"));
+        assert!(rendered.host_linker.contains(
+            "fn stream_write(&mut self, stream: u64, source: &[u8]) -> wasmtime::Result<usize>;"
+        ));
+        assert!(rendered
+            .host_linker
+            .contains("caller.get_export(\"memory\")"));
+        assert!(rendered
+            .host_linker
+            .contains("fn guest_memory_offset(value: i32) -> usize { value as u32 as usize }"));
+        assert!(rendered.host_linker.contains(
+            "checked_guest_memory_range(&memory, &caller, destination, destination_len)?"
+        ));
+        assert!(rendered.manifest.contains("name = \"stream_read\""));
+        assert!(rendered.manifest.contains("max_chunk_bytes = 65536"));
+        assert_eq!(
+            manifest["resources"][0]["max_chunk_bytes"].as_integer(),
+            Some(65536)
+        );
+    }
+
+    #[test]
+    fn streams_do_not_reserve_unused_type_specific_release_controls() {
+        let mut types = TypeMap::new();
+        for name in ["HTTPServer", "HttpServer"] {
+            types.insert(
+                TypeIdent::from(name),
+                Type::Resource(crate::types::Resource::stream(name)),
+            );
+        }
+        let rendered = render_bindings(&FunctionList::new(), &FunctionList::new(), &types)
+            .expect("streams share generic controls rather than type-specific release names");
+        assert_eq!(rendered.host_linker.matches("\"stream_read\"").count(), 1);
+        assert!(!rendered
+            .host_linker
+            .contains("resource_release_http_server"));
     }
 
     #[test]
@@ -1515,6 +1687,20 @@ mod tests {
         assert_eq!(
             rendered.host_linker,
             include_str!("../../tests/fixtures/wasmtime45_resource_host.rs")
+        );
+    }
+
+    #[test]
+    fn wasmtime45_stream_fixture_is_canonical_generated_host_golden() {
+        let mut types = TypeMap::new();
+        types.insert(
+            TypeIdent::from("Input"),
+            Type::Resource(crate::types::Resource::stream("Input")),
+        );
+        let rendered = render_bindings(&FunctionList::new(), &FunctionList::new(), &types).unwrap();
+        assert_eq!(
+            rendered.host_linker.trim_end(),
+            include_str!("../../tests/fixtures/wasmtime45_stream_host.rs").trim_end()
         );
     }
 
