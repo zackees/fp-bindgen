@@ -14,15 +14,56 @@ pub(crate) mod resources {
  }
 
 
+enum CallerMemory {
+    Ordinary(wasmtime::Memory),
+    Shared(wasmtime::SharedMemory),
+}
+impl CallerMemory {
+    fn data_size<T>(&self, caller: &wasmtime::Caller<'_, T>) -> usize {
+        match self { Self::Ordinary(memory) => memory.data_size(caller), Self::Shared(memory) => memory.data_size() }
+    }
+    fn read<T>(&self, caller: &wasmtime::Caller<'_, T>, offset: usize, destination: &mut [u8]) -> wasmtime::Result<()> {
+        match self {
+            Self::Ordinary(memory) => Ok(memory.read(caller, offset, destination)?),
+            Self::Shared(memory) => {
+                let end = offset.checked_add(destination.len()).ok_or_else(|| wasmtime::Error::msg("stream guest-memory range overflow"))?;
+                let cells = memory.data().get(offset..end).ok_or_else(|| wasmtime::Error::msg("stream guest-memory range is out of bounds"))?;
+                for (destination, cell) in destination.iter_mut().zip(cells) {
+                    // SAFETY: SharedMemory pins its backing allocation; atomic access avoids racing guest threads.
+                    *destination = unsafe { ::std::sync::atomic::AtomicU8::from_ptr(cell.get()) }.load(::std::sync::atomic::Ordering::Relaxed);
+                }
+                Ok(())
+            }
+        }
+    }
+    fn write<T>(&self, caller: &mut wasmtime::Caller<'_, T>, offset: usize, source: &[u8]) -> wasmtime::Result<()> {
+        match self {
+            Self::Ordinary(memory) => Ok(memory.write(caller, offset, source)?),
+            Self::Shared(memory) => {
+                let end = offset.checked_add(source.len()).ok_or_else(|| wasmtime::Error::msg("stream guest-memory range overflow"))?;
+                let cells = memory.data().get(offset..end).ok_or_else(|| wasmtime::Error::msg("stream guest-memory range is out of bounds"))?;
+                for (source, cell) in source.iter().zip(cells) {
+                    // SAFETY: SharedMemory pins its backing allocation; atomic access avoids racing guest threads.
+                    unsafe { ::std::sync::atomic::AtomicU8::from_ptr(cell.get()) }.store(*source, ::std::sync::atomic::Ordering::Relaxed);
+                }
+                Ok(())
+            }
+        }
+    }
+}
 fn bounded_stream_len(value: i32) -> wasmtime::Result<usize> {
     let value = usize::try_from(value).map_err(|_| wasmtime::Error::msg("negative stream chunk length"))?;
     if value <= 65536usize { Ok(value) } else { Err(wasmtime::Error::msg(format!("stream chunk exceeds 65536 bytes: {value}"))) }
 }
 fn guest_memory_offset(value: i32) -> usize { value as u32 as usize }
-fn caller_memory<T>(caller: &mut wasmtime::Caller<'_, T>) -> wasmtime::Result<wasmtime::Memory> {
-    caller.get_export("memory").and_then(|export| export.into_memory()).ok_or_else(|| wasmtime::Error::msg("stream controls require exported guest memory named `memory`"))
+fn caller_memory<T>(caller: &mut wasmtime::Caller<'_, T>) -> wasmtime::Result<CallerMemory> {
+    match caller.get_export("memory") {
+        Some(wasmtime::Extern::Memory(memory)) => Ok(CallerMemory::Ordinary(memory)),
+        Some(wasmtime::Extern::SharedMemory(memory)) => Ok(CallerMemory::Shared(memory)),
+        _ => Err(wasmtime::Error::msg("stream controls require exported guest memory named `memory`")),
+    }
 }
-fn checked_guest_memory_range<T>(memory: &wasmtime::Memory, caller: &wasmtime::Caller<'_, T>, offset: usize, length: usize) -> wasmtime::Result<()> {
+fn checked_guest_memory_range<T>(memory: &CallerMemory, caller: &wasmtime::Caller<'_, T>, offset: usize, length: usize) -> wasmtime::Result<()> {
     let end = offset.checked_add(length).ok_or_else(|| wasmtime::Error::msg("stream guest-memory range overflow"))?;
     if end <= memory.data_size(caller) { Ok(()) } else { Err(wasmtime::Error::msg("stream guest-memory range is out of bounds")) }
 }

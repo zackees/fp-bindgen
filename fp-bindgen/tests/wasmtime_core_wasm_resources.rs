@@ -108,6 +108,57 @@ fn generated_stream_controls_copy_only_a_bounded_caller_memory_chunk() {
 
 #[cfg(feature = "wasmtime45-integration")]
 #[test]
+fn generated_stream_controls_support_exported_shared_memory() {
+    let mut config = wasmtime::Config::new();
+    config.wasm_threads(true);
+    config.shared_memory(true);
+    let engine = wasmtime::Engine::new(&config).unwrap();
+    let mut linker = wasmtime::Linker::new(&engine);
+    generated_stream::link_kernal_api_v1(&mut linker).unwrap();
+    let module = wasmtime::Module::new(
+        &engine,
+        r#"
+        (module
+            (import "env" "memory" (memory 1 2 shared))
+            (import "kernal-api:v1" "stream_read" (func $read (param i64 i32 i32) (result i32)))
+            (import "kernal-api:v1" "stream_write" (func $write (param i64 i32 i32) (result i32)))
+            (export "memory" (memory 0))
+            (data (i32.const 0) "ping")
+            (func (export "write") (result i32)
+                i64.const 7 i32.const 0 i32.const 4 call $write)
+            (func (export "read") (result i32)
+                i64.const 7 i32.const 16 i32.const 4 call $read))
+        "#,
+    )
+    .unwrap();
+    let shared = wasmtime::SharedMemory::new(&engine, wasmtime::MemoryType::shared(1, 2)).unwrap();
+    let mut store = wasmtime::Store::new(&engine, StreamHost::default());
+    linker
+        .define(&store, "env", "memory", shared.clone())
+        .unwrap();
+    let instance = linker.instantiate(&mut store, &module).unwrap();
+    for name in ["write", "read"] {
+        let function = instance
+            .get_typed_func::<(), i32>(&mut store, name)
+            .unwrap();
+        assert_eq!(function.call(&mut store, ()).unwrap(), 4);
+    }
+    let received = shared.data();
+    let bytes: Vec<_> = received[16..20]
+        .iter()
+        .map(|cell| {
+            // SAFETY: SharedMemory owns these cells and atomic loads avoid a guest race.
+            unsafe { std::sync::atomic::AtomicU8::from_ptr(cell.get()) }
+                .load(std::sync::atomic::Ordering::Relaxed)
+        })
+        .collect();
+    assert_eq!(&bytes, b"pong");
+    assert_eq!(store.data().writes, vec![(7, b"ping".to_vec())]);
+    assert_eq!(store.data().reads, 1);
+}
+
+#[cfg(feature = "wasmtime45-integration")]
+#[test]
 fn generated_wasmtime_resource_glue_preserves_full_width_imports_and_exports() {
     #[derive(Default)]
     struct Host {
