@@ -13,8 +13,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and an opt-in Wasmtime 45 template compile check.
 - Add a nominal `Resource` IR declaration and opaque guest/host handle templates for the
   Core-Wasm lineage, including nominal synchronous signatures and async-import result lowering
-  through the `i64` handle ABI. Resource lifecycle and stream operations remain versioned ABI
-  work rather than a serializable-value fallback.
+  through the `i64` handle ABI.
+- Add opt-in `Resource::owned` lowering for the Core-Wasm lineage. Generated guests now retain
+  owned handles across pending async calls, release them explicitly or on normal drop through
+  per-resource controls, and reject implicit owned-resource guest exports. The host retains
+  sole responsibility for atomic scope/generation validation and trap/Store teardown through its
+  canonical resource registry; this does not add a second registry or a stream ABI.
 - Add ability to add `publish` to the generated Cargo.toml file (#208)
 - Fix generating publish value as a toml bool (#209)
 

@@ -181,10 +181,14 @@ Currently, we support the following binding types:
 - `BindingsType::RustWasmerRuntime`: Generates runtime bindings for use with Wasmer.
 - `BindingsType::RustWasmtimeCoreWasm`: Generates a deterministic Core Wasm ABI
   (`kernal-api:v1`) for a Wasmtime 45 host. It supports scalar values plus declared nominal,
-  opaque resource handles in synchronous signatures and async-import results. Async imports use
-  bounded operation handles (`poll`, `take-result`, `yield`, and `cancel`); async exports, bulk
-  values, undeclared handles, and user-defined value transport are rejected rather than using
-  the legacy allocation or serialization protocol. Enable the dependency-free
+  opaque resource handles in synchronous signatures and async-import results. `Resource::owned`
+  emits a non-copy guest capability with an explicit release import, normal-drop cleanup, and a
+  borrow held through a pending async operation; the host release hook must atomically delegate
+  to its canonical scope/generation registry. Owned resources are rejected in guest exports until
+  transfer semantics are declared. Async imports use bounded operation handles (`poll`,
+  `take-result`, `yield`, and `cancel`); async exports, bulk values, undeclared handles, and
+  user-defined value transport are rejected rather than using the legacy allocation or
+  serialization protocol. Enable the dependency-free
   `wasmtime-core-wasm` feature; use
   `try_generate_wasmtime_core_wasm_bindings` when output errors must be handled explicitly.
   The separate `wasmtime45-integration` feature only compile-checks the emitted host template.
