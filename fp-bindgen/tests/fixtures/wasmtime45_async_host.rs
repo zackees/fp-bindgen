@@ -1,5 +1,5 @@
-// Generated private Wasmtime 45 glue for scalar Core Wasm ABI `kernal-api:v1`.
-// Host trait and invocation helpers use semantic Rust scalar types.
+// Generated private Wasmtime 45 glue for Core Wasm ABI `kernal-api:v1`.
+// Host trait and invocation helpers use semantic scalar and resource types.
 
 fn u32_from_i32(value: i32) -> wasmtime::Result<u32> {
     Ok(value as u32)

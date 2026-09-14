@@ -179,11 +179,13 @@ Currently, we support the following binding types:
 
 - `BindingsType::RustPlugin`: Generates bindings for a Rust plugin.
 - `BindingsType::RustWasmerRuntime`: Generates runtime bindings for use with Wasmer.
-- `BindingsType::RustWasmtimeCoreWasm`: Generates a deterministic, scalar-only Core Wasm ABI
-  (`kernal-api:v1`) for a Wasmtime 45 host. This v0 target supports async scalar imports through
-  bounded operation handles (`poll`, `take-result`, `yield`, and `cancel`), and rejects async
-  exports, bulk values, and user-defined values rather than using the legacy allocation or
-  serialization protocol. Enable the dependency-free `wasmtime-core-wasm` feature; use
+- `BindingsType::RustWasmtimeCoreWasm`: Generates a deterministic Core Wasm ABI
+  (`kernal-api:v1`) for a Wasmtime 45 host. It supports scalar values plus declared nominal,
+  opaque resource handles in synchronous signatures and async-import results. Async imports use
+  bounded operation handles (`poll`, `take-result`, `yield`, and `cancel`); async exports, bulk
+  values, undeclared handles, and user-defined value transport are rejected rather than using
+  the legacy allocation or serialization protocol. Enable the dependency-free
+  `wasmtime-core-wasm` feature; use
   `try_generate_wasmtime_core_wasm_bindings` when output errors must be handled explicitly.
   The separate `wasmtime45-integration` feature only compile-checks the emitted host template.
 - `BindingsType::TsRuntimeWithExtendedConfig`: Generates bindings for a TypeScript runtime.
