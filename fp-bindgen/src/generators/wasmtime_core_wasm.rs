@@ -28,6 +28,8 @@ const OPERATION_CONTROLS: [&str; 4] = [
     "yield_operation",
     "cancel_operation",
 ];
+const STREAM_CONTROLS: [&str; 3] = ["stream_read", "stream_write", "stream_close"];
+const MAX_STREAM_CHUNK_BYTES: u32 = 64 * 1024;
 
 struct RenderedBindings {
     guest_cargo: String,
@@ -123,6 +125,7 @@ fn lower_functions<'a>(
             });
         }
         if OPERATION_CONTROLS.contains(&function.name.as_str())
+            || STREAM_CONTROLS.contains(&function.name.as_str())
             || owned_resource_release_names(types).contains(&function.name)
         {
             return Err(WasmtimeCoreWasmError::ReservedOperationControl {
@@ -955,7 +958,7 @@ fn render_manifest(
         .values()
         .filter_map(|ty| match ty {
             Type::Resource(resource) => Some(format!(
-                "[[resources]]\nname = \"{}\"\nkind = \"opaque_host_handle\"\nownership = \"{}\"\nabi = \"i64\"\n\n",
+                "[[resources]]\nname = \"{}\"\nkind = \"opaque_host_handle\"\nownership = \"{}\"\nabi = \"i64\"\n{}\n",
                 resource.ident,
                 if resource.is_stream() {
                     "stream"
@@ -963,6 +966,11 @@ fn render_manifest(
                     "owned"
                 } else {
                     "transport"
+                },
+                if resource.is_stream() {
+                    format!("max_chunk_bytes = {MAX_STREAM_CHUNK_BYTES}")
+                } else {
+                    String::new()
                 },
             )),
             _ => None,
