@@ -1,12 +1,110 @@
 #![cfg(feature = "wasmtime-core-wasm")]
 
 use fp_bindgen::prelude::*;
-use std::{collections::BTreeSet, path::Path, process::Command, time::SystemTime};
+use std::{path::Path, process::Command, time::SystemTime};
+
+#[cfg(feature = "wasmtime45-integration")]
+use std::collections::BTreeSet;
 
 #[cfg(feature = "wasmtime45-integration")]
 #[rustfmt::skip]
 #[path = "fixtures/wasmtime45_resource_host.rs"]
 mod generated_host;
+
+#[cfg(feature = "wasmtime45-integration")]
+#[rustfmt::skip]
+#[path = "fixtures/wasmtime45_stream_host.rs"]
+mod generated_stream;
+
+#[cfg(feature = "wasmtime45-integration")]
+#[derive(Default)]
+struct StreamHost {
+    writes: Vec<(u64, Vec<u8>)>,
+    reads: usize,
+    closes: Vec<u64>,
+}
+
+#[cfg(feature = "wasmtime45-integration")]
+impl generated_stream::KernalApiV1Imports for StreamHost {
+    fn stream_read(&mut self, stream: u64, destination: &mut [u8]) -> wasmtime::Result<usize> {
+        assert_eq!(stream, 7);
+        assert_eq!(destination.len(), 4);
+        destination.copy_from_slice(b"pong");
+        self.reads += 1;
+        Ok(4)
+    }
+
+    fn stream_write(&mut self, stream: u64, source: &[u8]) -> wasmtime::Result<usize> {
+        self.writes.push((stream, source.to_vec()));
+        Ok(source.len())
+    }
+
+    fn stream_close(&mut self, stream: u64) -> wasmtime::Result<i32> {
+        self.closes.push(stream);
+        Ok(0)
+    }
+}
+
+#[cfg(feature = "wasmtime45-integration")]
+#[test]
+fn generated_stream_controls_copy_only_a_bounded_caller_memory_chunk() {
+    let engine = wasmtime::Engine::default();
+    let mut linker = wasmtime::Linker::new(&engine);
+    generated_stream::link_kernal_api_v1(&mut linker).unwrap();
+    let module = wasmtime::Module::new(
+        &engine,
+        r#"
+        (module
+            (import "kernal-api:v1" "stream_read" (func $read (param i64 i32 i32) (result i32)))
+            (import "kernal-api:v1" "stream_write" (func $write (param i64 i32 i32) (result i32)))
+            (import "kernal-api:v1" "stream_close" (func $close (param i64) (result i32)))
+            (memory (export "memory") 2)
+            (data (i32.const 0) "ping")
+            (func (export "write") (result i32)
+                i64.const 7 i32.const 0 i32.const 4 call $write)
+            (func (export "read") (result i32)
+                i64.const 7 i32.const 16 i32.const 4 call $read)
+            (func (export "invalid_read") (result i32)
+                i64.const 7 i32.const 131071 i32.const 4 call $read)
+            (func (export "oversize") (result i32)
+                i64.const 7 i32.const 0 i32.const 65537 call $write)
+            (func (export "close") (result i32)
+                i64.const 7 call $close))
+        "#,
+    )
+    .unwrap();
+    let mut store = wasmtime::Store::new(&engine, StreamHost::default());
+    let instance = linker.instantiate(&mut store, &module).unwrap();
+    for (name, expected) in [("write", 4), ("read", 4), ("close", 0)] {
+        let function = instance
+            .get_typed_func::<(), i32>(&mut store, name)
+            .unwrap();
+        assert_eq!(function.call(&mut store, ()).unwrap(), expected);
+    }
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    let mut received = [0; 4];
+    memory.read(&store, 16, &mut received).unwrap();
+    assert_eq!(&received, b"pong");
+    assert_eq!(store.data().writes, vec![(7, b"ping".to_vec())]);
+    assert_eq!(store.data().reads, 1);
+    assert_eq!(store.data().closes, vec![7]);
+
+    let invalid_read = instance
+        .get_typed_func::<(), i32>(&mut store, "invalid_read")
+        .unwrap();
+    assert!(invalid_read.call(&mut store, ()).is_err());
+    assert_eq!(
+        store.data().reads,
+        1,
+        "an invalid guest destination must fail before consuming host stream bytes"
+    );
+
+    let oversize = instance
+        .get_typed_func::<(), i32>(&mut store, "oversize")
+        .unwrap();
+    assert!(oversize.call(&mut store, ()).is_err());
+    assert_eq!(store.data().writes, vec![(7, b"ping".to_vec())]);
+}
 
 #[cfg(feature = "wasmtime45-integration")]
 #[test]
@@ -206,6 +304,42 @@ fn cargo_fails(output: &Path, args: &[&str]) {
         "borrow-rejection proof failed for an unexpected reason:\n{}",
         String::from_utf8_lossy(&result.stderr),
     );
+}
+
+#[test]
+fn generated_stream_guest_compiles_to_wasm_without_a_value_transport_runtime() {
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let output = std::env::temp_dir().join(format!(
+        "fp-bindgen-stream-guest-{}-{nonce}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&output);
+    std::fs::create_dir(&output).unwrap();
+    let mut types = TypeMap::new();
+    types.insert(
+        TypeIdent::from("Input"),
+        Type::Resource(Resource::stream("Input")),
+    );
+    try_generate_wasmtime_core_wasm_bindings(
+        FunctionList::new(),
+        FunctionList::new(),
+        types,
+        output.to_str().unwrap(),
+    )
+    .unwrap();
+    let source = std::fs::read_to_string(output.join("src/lib.rs")).unwrap();
+    assert!(source.contains("&mut [u8]"));
+    assert!(source.contains("&[u8]"));
+    assert!(!source.contains("MessagePack"));
+    assert!(!source.contains("FatPtr"));
+    cargo(&output, &["build", "--target", "wasm32-unknown-unknown"]);
+    assert!(output
+        .join("target/wasm32-unknown-unknown/debug/kernal_api_v1_bindings.wasm")
+        .is_file());
+    std::fs::remove_dir_all(output).unwrap();
 }
 
 #[test]
