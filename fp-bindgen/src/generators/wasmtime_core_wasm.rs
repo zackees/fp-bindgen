@@ -73,8 +73,8 @@ fn render_bindings(
     validate_type_definitions(types)?;
     Ok(RenderedBindings {
         guest_cargo: render_guest_cargo(),
-        guest_source: render_guest_source(import_functions, export_functions),
-        host_linker: render_host_linker(import_functions, export_functions),
+        guest_source: render_guest_source(import_functions, export_functions, types),
+        host_linker: render_host_linker(import_functions, export_functions, types),
         manifest: render_manifest(import_functions, export_functions),
     })
 }
@@ -116,6 +116,18 @@ fn validate_type_definitions(types: &TypeMap) -> Result<(), WasmtimeCoreWasmErro
     for (ident, ty) in types {
         match ty {
             Type::Primitive(primitive) if lower_primitive(*primitive).is_some() => {}
+            Type::Resource(resource) if resource.ident == *ident => {
+                if resource.ident.is_array()
+                    || !resource.ident.generic_args.is_empty()
+                    || resource.ident.as_primitive().is_some()
+                    || resource.ident.name.starts_with("r#")
+                    || syn::parse_str::<syn::Ident>(&resource.ident.name).is_err()
+                {
+                    return Err(WasmtimeCoreWasmError::InvalidResourceName {
+                        name: resource.ident.to_string(),
+                    });
+                }
+            }
             Type::Unit => {}
             _ => {
                 return Err(WasmtimeCoreWasmError::UnsupportedTypeDefinition {
@@ -248,7 +260,11 @@ fn render_guest_cargo() -> String {
         .to_owned()
 }
 
-fn render_guest_source(import_functions: &FunctionList, export_functions: &FunctionList) -> String {
+fn render_guest_source(
+    import_functions: &FunctionList,
+    export_functions: &FunctionList,
+    types: &TypeMap,
+) -> String {
     let has_async_imports = import_functions.iter().any(|function| function.is_async);
     let raw_imports = import_functions
         .iter()
@@ -286,6 +302,7 @@ fn render_guest_source(import_functions: &FunctionList, export_functions: &Funct
     } else {
         ""
     };
+    let resources = render_guest_resource_types(types);
     format!(
         "// Generated scalar Core Wasm guest bindings for `{ABI_NAMESPACE}`.\n\
          // The public API uses semantic Rust scalar types; raw ABI values stay private.\n\n\
@@ -300,6 +317,7 @@ fn render_guest_source(import_functions: &FunctionList, export_functions: &Funct
          pub enum ExportInstallError {{\n\
          \u{20}   AlreadyInstalled,\n\
          }}\n\n\
+         {resources}\
          fn bool_from_i32(value: i32) -> Result<bool, AbiError> {{ match value {{ 0 => Ok(false), 1 => Ok(true), value => Err(AbiError::InvalidBoolean(value)) }} }}\n\
          fn i8_from_i32(value: i32) -> Result<i8, AbiError> {{ value.try_into().map_err(|_| AbiError::OutOfRange {{ ty: \"i8\", value }}) }}\n\
          fn i16_from_i32(value: i32) -> Result<i16, AbiError> {{ value.try_into().map_err(|_| AbiError::OutOfRange {{ ty: \"i16\", value }}) }}\n\
@@ -343,6 +361,25 @@ fn render_guest_source(import_functions: &FunctionList, export_functions: &Funct
          fn require_abi<T>(value: Result<T, AbiError>) -> T {{ value.expect(\"host passed an invalid scalar Core Wasm ABI value\") }}\n\n\
          {export_wrappers}\n"
     )
+}
+
+fn render_guest_resource_types(types: &TypeMap) -> String {
+    let definitions = types
+        .values()
+        .filter_map(|ty| match ty {
+            Type::Resource(resource) => Some(format!(
+                "#[repr(transparent)]\n#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]\npub struct {}(u64);\n\nimpl {} {{\n    pub(crate) fn from_abi(raw: u64) -> Self {{ Self(raw) }}\n    pub(crate) fn into_abi(self) -> u64 {{ self.0 }}\n}}\n\n",
+                resource.ident, resource.ident
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    if definitions.is_empty() {
+        definitions
+    } else {
+        format!("pub mod resources {{\n{} }}\n\n", indent(&definitions, 4))
+    }
 }
 
 fn render_guest_raw_import(function: &Function) -> String {
@@ -461,7 +498,11 @@ fn render_guest_export_wrapper(function: &Function) -> String {
     )
 }
 
-fn render_host_linker(import_functions: &FunctionList, export_functions: &FunctionList) -> String {
+fn render_host_linker(
+    import_functions: &FunctionList,
+    export_functions: &FunctionList,
+    types: &TypeMap,
+) -> String {
     let has_async_imports = import_functions.iter().any(|function| function.is_async);
     let helpers = render_host_helpers(import_functions, export_functions);
     let trait_methods = import_functions
@@ -485,9 +526,11 @@ fn render_host_linker(import_functions: &FunctionList, export_functions: &Functi
         .map(render_host_invocation)
         .collect::<Vec<_>>()
         .join("\n\n");
+    let resources = render_host_resource_types(types);
     format!(
         "// Generated private Wasmtime 45 glue for scalar Core Wasm ABI `{ABI_NAMESPACE}`.\n\
          // Host trait and invocation helpers use semantic Rust scalar types.\n\n\
+         {resources}\
          {helpers}\n\n\
          pub(crate) trait KernalApiV1Imports {{\n{trait_methods}\n{operation_trait_methods}}}\n\n\
          pub(crate) fn link_kernal_api_v1<T>(linker: &mut wasmtime::Linker<T>) -> wasmtime::Result<()>\n\
@@ -496,6 +539,36 @@ fn render_host_linker(import_functions: &FunctionList, export_functions: &Functi
          {{\n{registrations}\n{operation_registrations}    Ok(())\n}}\n\n\
          {invocations}\n"
     )
+}
+
+fn render_host_resource_types(types: &TypeMap) -> String {
+    let definitions = types
+        .values()
+        .filter_map(|ty| match ty {
+            Type::Resource(resource) => Some(format!(
+                "#[repr(transparent)]\n#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]\npub(crate) struct {}(pub(crate) u64);\n\n",
+                resource.ident
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    if definitions.is_empty() {
+        definitions
+    } else {
+        format!(
+            "pub(crate) mod resources {{\n{} }}\n\n",
+            indent(&definitions, 4)
+        )
+    }
+}
+
+fn indent(source: &str, spaces: usize) -> String {
+    let prefix = " ".repeat(spaces);
+    source
+        .lines()
+        .map(|line| format!("{prefix}{line}\n"))
+        .collect()
 }
 
 fn render_host_helpers(import_functions: &FunctionList, export_functions: &FunctionList) -> String {
@@ -939,6 +1012,79 @@ mod tests {
             assert!(!rendered.guest_source.contains(legacy));
             assert!(!rendered.host_linker.contains(legacy));
             assert!(!rendered.manifest.contains(legacy));
+        }
+    }
+
+    #[test]
+    fn resource_declarations_render_nominal_opaque_handles_on_both_sides() {
+        let mut types = TypeMap::new();
+        types.insert(
+            TypeIdent::from("Archive"),
+            Type::Resource(crate::types::Resource::new("Archive")),
+        );
+        let rendered = render_bindings(&FunctionList::new(), &FunctionList::new(), &types).unwrap();
+
+        assert!(rendered.guest_source.contains("pub mod resources {"));
+        assert!(rendered.guest_source.contains("pub struct Archive(u64);"));
+        assert!(rendered
+            .guest_source
+            .contains("pub(crate) fn from_abi(raw: u64) -> Self"));
+        assert!(rendered.host_linker.contains("pub(crate) mod resources {"));
+        assert!(rendered
+            .host_linker
+            .contains("pub(crate) struct Archive(pub(crate) u64);"));
+        assert!(!rendered.manifest.contains("Archive"));
+    }
+
+    #[test]
+    fn resource_declaration_must_match_its_type_map_identity() {
+        let mut types = TypeMap::new();
+        types.insert(
+            TypeIdent::from("Archive"),
+            Type::Resource(crate::types::Resource::new("Other")),
+        );
+        assert!(matches!(
+            render_bindings(&FunctionList::new(), &FunctionList::new(), &types),
+            Err(WasmtimeCoreWasmError::UnsupportedTypeDefinition { .. })
+        ));
+    }
+
+    #[test]
+    fn resource_declaration_is_isolated_from_generated_binding_names() {
+        let mut types = TypeMap::new();
+        types.insert(
+            TypeIdent::from("OnceLock"),
+            Type::Resource(crate::types::Resource::new("OnceLock")),
+        );
+        let rendered = render_bindings(&FunctionList::new(), &FunctionList::new(), &types).unwrap();
+        assert!(rendered.guest_source.contains("pub struct OnceLock(u64);"));
+    }
+
+    #[test]
+    fn resource_declaration_must_be_a_plain_rust_identifier() {
+        let mut types = TypeMap::new();
+        types.insert(
+            TypeIdent::from("not-valid"),
+            Type::Resource(crate::types::Resource::new("not-valid")),
+        );
+        assert!(matches!(
+            render_bindings(&FunctionList::new(), &FunctionList::new(), &types),
+            Err(WasmtimeCoreWasmError::InvalidResourceName { .. })
+        ));
+    }
+
+    #[test]
+    fn resource_declaration_cannot_shadow_or_alias_a_primitive_identifier() {
+        for name in ["u64", "r#Archive"] {
+            let mut types = TypeMap::new();
+            types.insert(
+                TypeIdent::from(name),
+                Type::Resource(crate::types::Resource::new(name)),
+            );
+            assert!(matches!(
+                render_bindings(&FunctionList::new(), &FunctionList::new(), &types),
+                Err(WasmtimeCoreWasmError::InvalidResourceName { .. })
+            ));
         }
     }
 

@@ -14,6 +14,23 @@ pub use enums::{Enum, EnumOptions, Variant, VariantAttrs};
 pub use structs::{Field, FieldAttrs, Struct, StructOptions};
 pub use type_ident::TypeIdent;
 
+/// A nominal opaque capability handle owned by the host runtime.
+///
+/// A resource is not a serializable value. Backends must lower it through a
+/// versioned handle ABI and preserve its host-owned lifecycle.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct Resource {
+    pub ident: TypeIdent,
+}
+
+impl Resource {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            ident: TypeIdent::from(name.into()),
+        }
+    }
+}
+
 pub type TypeMap = BTreeMap<TypeIdent, Type>;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -26,6 +43,7 @@ pub enum Type {
     List(String, TypeIdent),
     Map(String, TypeIdent, TypeIdent),
     Primitive(Primitive),
+    Resource(Resource),
     String,
     Struct(Struct),
     Tuple(Vec<TypeIdent>),
@@ -55,6 +73,7 @@ impl Type {
             Self::List(name, ident) => format!("{name}<{ident}>"),
             Self::Map(name, key, value) => format!("{name}<{key}, {value}>"),
             Self::Primitive(primitive) => primitive.name(),
+            Self::Resource(resource) => resource.ident.to_string(),
             Self::String => "String".to_owned(),
             Self::Struct(Struct { ident, .. }) => ident.to_string(),
             Self::Tuple(items) => format!(

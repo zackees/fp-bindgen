@@ -1025,6 +1025,10 @@ fn format_type_with_ident(ty: &Type, ident: &TypeIdent, types: &TypeMap, scope: 
             )
         }
         Type::Primitive(primitive) => format_encoded_primitive(*primitive).to_owned(),
+        Type::Resource(resource) => panic!(
+            "resource `{}` reached the TypeScript value generator without a resource ABI",
+            resource.ident
+        ),
         Type::String => "string".to_owned(),
         Type::Tuple(items) => format!(
             "[{}]",
