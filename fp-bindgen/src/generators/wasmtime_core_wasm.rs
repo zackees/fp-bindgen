@@ -8,7 +8,7 @@ use crate::{
     functions::FunctionList,
     generators::WasmtimeCoreWasmError,
     primitives::Primitive,
-    types::{ResourceOwnership, Type, TypeIdent, TypeMap},
+    types::{Type, TypeIdent, TypeMap},
 };
 use inflector::Inflector;
 use std::{collections::BTreeSet, fs, path::Path};
@@ -233,7 +233,7 @@ fn lower_value_type<'a>(
     if matches!(types.get(ty), Some(Type::Resource(_))) {
         let owned_resource = matches!(
             types.get(ty),
-            Some(Type::Resource(resource)) if resource.ownership == ResourceOwnership::Owned
+            Some(Type::Resource(resource)) if resource.is_owned()
         );
         return Ok(LoweredType {
             semantic: &ty.name,
@@ -957,7 +957,13 @@ fn render_manifest(
             Type::Resource(resource) => Some(format!(
                 "[[resources]]\nname = \"{}\"\nkind = \"opaque_host_handle\"\nownership = \"{}\"\nabi = \"i64\"\n\n",
                 resource.ident,
-                if resource.is_owned() { "owned" } else { "transport" },
+                if resource.is_stream() {
+                    "stream"
+                } else if resource.is_owned() {
+                    "owned"
+                } else {
+                    "transport"
+                },
             )),
             _ => None,
         })
@@ -1269,6 +1275,27 @@ mod tests {
             Type::Resource(crate::types::Resource::owned("Archive")),
         );
         types
+    }
+
+    #[test]
+    fn stream_declaration_is_an_owned_handle_with_distinct_manifest_policy() {
+        let mut types = TypeMap::new();
+        types.insert(
+            TypeIdent::from("Input"),
+            Type::Resource(crate::types::Resource::stream("Input")),
+        );
+        let rendered = render_bindings(&FunctionList::new(), &FunctionList::new(), &types).unwrap();
+        assert!(rendered
+            .guest_source
+            .contains("pub struct Input(::core::option::Option<u64>)"));
+        assert!(rendered.guest_source.contains("resource_release_input"));
+        let manifest: toml::Value = rendered.manifest.parse().unwrap();
+        assert_eq!(
+            manifest["resources"][0]["ownership"].as_str(),
+            Some("stream")
+        );
+        assert!(!rendered.guest_source.contains("Vec<u8>"));
+        assert!(!rendered.host_linker.contains("MessagePack"));
     }
 
     #[test]

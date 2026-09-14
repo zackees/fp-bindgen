@@ -36,6 +36,9 @@ pub struct Resource {
 pub enum ResourceOwnership {
     Transport,
     Owned,
+    /// An owned resource reserved for bounded, caller-memory stream controls.
+    /// It deliberately has no value/MessagePack lowering path.
+    Stream,
 }
 
 impl Resource {
@@ -59,8 +62,25 @@ impl Resource {
         }
     }
 
+    /// Declares an owned byte-stream capability. Core-Wasm backends must lower
+    /// it as a handle and provide bounded transfer controls; it is never a
+    /// `Vec<u8>` value transport.
+    pub fn stream(name: impl Into<String>) -> Self {
+        Self {
+            ident: TypeIdent::from(name.into()),
+            ownership: ResourceOwnership::Stream,
+        }
+    }
+
     pub fn is_owned(&self) -> bool {
-        self.ownership == ResourceOwnership::Owned
+        matches!(
+            self.ownership,
+            ResourceOwnership::Owned | ResourceOwnership::Stream
+        )
+    }
+
+    pub fn is_stream(&self) -> bool {
+        self.ownership == ResourceOwnership::Stream
     }
 }
 
