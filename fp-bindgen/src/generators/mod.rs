@@ -1,8 +1,11 @@
 #[cfg(feature = "generators")]
 use crate::types::CargoDependency;
 #[cfg(feature = "generators")]
-use crate::types::{Type, TypeIdent};
-use crate::{functions::FunctionList, types::TypeMap};
+use crate::types::TypeIdent;
+use crate::{
+    functions::FunctionList,
+    types::{Type, TypeMap},
+};
 #[cfg(feature = "generators")]
 use std::collections::BTreeMap;
 #[cfg(feature = "generators")]
@@ -342,6 +345,12 @@ pub enum WasmtimeCoreWasmError {
         name: String,
         ty: String,
     },
+    InvalidResourceName {
+        name: String,
+    },
+    ResourceUnsupportedByBinding {
+        bindings_type: String,
+    },
     Io {
         path: String,
         source: io::Error,
@@ -378,6 +387,14 @@ impl Display for WasmtimeCoreWasmError {
                 f,
                 "type definition `{name}` (`{ty}`) is unsupported; the Wasmtime Core Wasm v0 ABI has no bulk or user-defined types"
             ),
+            Self::InvalidResourceName { name } => write!(
+                f,
+                "resource declaration `{name}` is not a plain Rust identifier"
+            ),
+            Self::ResourceUnsupportedByBinding { bindings_type } => write!(
+                f,
+                "binding target `{bindings_type}` has no opaque resource ABI"
+            ),
             Self::Io { path, source } => write!(f, "could not write `{path}`: {source}"),
         }
     }
@@ -412,6 +429,13 @@ pub fn generate_bindings(
     types: TypeMap,
     config: BindingConfig,
 ) -> Result<(), WasmtimeCoreWasmError> {
+    if types.values().any(|ty| matches!(ty, Type::Resource(_)))
+        && !binding_supports_resources(&config.bindings_type)
+    {
+        return Err(WasmtimeCoreWasmError::ResourceUnsupportedByBinding {
+            bindings_type: config.bindings_type.to_string(),
+        });
+    }
     #[cfg(feature = "generators")]
     {
         fs::create_dir_all(config.path).expect("Could not create output directory");
@@ -469,6 +493,16 @@ pub fn generate_bindings(
             Ok(())
         }
     }
+}
+
+fn binding_supports_resources(bindings_type: &BindingsType) -> bool {
+    #[cfg(feature = "wasmtime-core-wasm")]
+    if matches!(bindings_type, BindingsType::RustWasmtimeCoreWasm) {
+        return true;
+    }
+    #[cfg(not(feature = "wasmtime-core-wasm"))]
+    let _ = bindings_type;
+    false
 }
 
 #[cfg(feature = "generators")]
@@ -552,5 +586,38 @@ where
             You may wish to create a newtype to avoid this warning.\n\
             See `examples/example-protocol/src/types/time.rs` for an example."
         );
+    }
+}
+
+#[cfg(all(test, feature = "generators"))]
+mod tests {
+    use super::*;
+    use crate::types::{Resource, TypeIdent};
+
+    #[test]
+    fn resource_ir_is_rejected_before_legacy_value_binding_output() {
+        let mut types = TypeMap::new();
+        types.insert(
+            TypeIdent::from("Archive"),
+            Type::Resource(Resource::new("Archive")),
+        );
+        let error = generate_bindings(
+            FunctionList::new(),
+            FunctionList::new(),
+            types,
+            BindingConfig {
+                bindings_type: BindingsType::RustPlugin(
+                    RustPluginConfig::builder()
+                        .name("resource-rejection-test")
+                        .build(),
+                ),
+                path: "/this-path-must-not-be-created-by-resource-rejection",
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            WasmtimeCoreWasmError::ResourceUnsupportedByBinding { .. }
+        ));
     }
 }

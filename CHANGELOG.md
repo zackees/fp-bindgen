@@ -11,6 +11,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Add a dependency-free, deterministic, scalar-only Wasmtime Core Wasm generator for the
   `kernal-api:v1` ABI, including a versioned TOML manifest, typed guest/host source templates,
   and an opt-in Wasmtime 45 template compile check.
+- Add a nominal `Resource` IR declaration and opaque guest/host handle templates for the
+  Core-Wasm lineage. Resource operation lowering remains versioned ABI work rather than a
+  serializable-value fallback.
 - Add ability to add `publish` to the generated Cargo.toml file (#208)
 - Fix generating publish value as a toml bool (#209)
 
