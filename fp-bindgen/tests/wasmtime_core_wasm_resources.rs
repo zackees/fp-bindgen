@@ -22,21 +22,36 @@ struct StreamHost {
     writes: Vec<(u64, Vec<u8>)>,
     reads: usize,
     closes: Vec<u64>,
+    reject_transfers: bool,
 }
 
 #[cfg(feature = "wasmtime45-integration")]
 impl generated_stream::KernalApiV1Imports for StreamHost {
-    fn stream_read(&mut self, stream: u64, destination: &mut [u8]) -> wasmtime::Result<usize> {
+    fn stream_read(
+        &mut self,
+        stream: u64,
+        destination: &mut [u8],
+    ) -> wasmtime::Result<generated_stream::StreamTransfer> {
+        if self.reject_transfers {
+            return Ok(generated_stream::StreamTransfer::Rejected);
+        }
         assert_eq!(stream, 7);
         assert_eq!(destination.len(), 4);
         destination.copy_from_slice(b"pong");
         self.reads += 1;
-        Ok(4)
+        Ok(generated_stream::StreamTransfer::Transferred(4))
     }
 
-    fn stream_write(&mut self, stream: u64, source: &[u8]) -> wasmtime::Result<usize> {
+    fn stream_write(
+        &mut self,
+        stream: u64,
+        source: &[u8],
+    ) -> wasmtime::Result<generated_stream::StreamTransfer> {
+        if self.reject_transfers {
+            return Ok(generated_stream::StreamTransfer::Rejected);
+        }
         self.writes.push((stream, source.to_vec()));
-        Ok(source.len())
+        Ok(generated_stream::StreamTransfer::Transferred(source.len()))
     }
 
     fn stream_close(&mut self, stream: u64) -> wasmtime::Result<i32> {
@@ -89,6 +104,12 @@ fn generated_stream_controls_copy_only_a_bounded_caller_memory_chunk() {
     assert_eq!(store.data().reads, 1);
     assert_eq!(store.data().closes, vec![7]);
 
+    store.data_mut().reject_transfers = true;
+    let rejected_read = instance
+        .get_typed_func::<(), i32>(&mut store, "read")
+        .unwrap();
+    assert_eq!(rejected_read.call(&mut store, ()).unwrap(), -1);
+
     let invalid_read = instance
         .get_typed_func::<(), i32>(&mut store, "invalid_read")
         .unwrap();
@@ -104,6 +125,57 @@ fn generated_stream_controls_copy_only_a_bounded_caller_memory_chunk() {
         .unwrap();
     assert!(oversize.call(&mut store, ()).is_err());
     assert_eq!(store.data().writes, vec![(7, b"ping".to_vec())]);
+}
+
+#[cfg(feature = "wasmtime45-integration")]
+#[test]
+fn generated_stream_controls_support_exported_shared_memory() {
+    let mut config = wasmtime::Config::new();
+    config.wasm_threads(true);
+    config.shared_memory(true);
+    let engine = wasmtime::Engine::new(&config).unwrap();
+    let mut linker = wasmtime::Linker::new(&engine);
+    generated_stream::link_kernal_api_v1(&mut linker).unwrap();
+    let module = wasmtime::Module::new(
+        &engine,
+        r#"
+        (module
+            (import "env" "memory" (memory 1 2 shared))
+            (import "kernal-api:v1" "stream_read" (func $read (param i64 i32 i32) (result i32)))
+            (import "kernal-api:v1" "stream_write" (func $write (param i64 i32 i32) (result i32)))
+            (export "memory" (memory 0))
+            (data (i32.const 0) "ping")
+            (func (export "write") (result i32)
+                i64.const 7 i32.const 0 i32.const 4 call $write)
+            (func (export "read") (result i32)
+                i64.const 7 i32.const 16 i32.const 4 call $read))
+        "#,
+    )
+    .unwrap();
+    let shared = wasmtime::SharedMemory::new(&engine, wasmtime::MemoryType::shared(1, 2)).unwrap();
+    let mut store = wasmtime::Store::new(&engine, StreamHost::default());
+    linker
+        .define(&store, "env", "memory", shared.clone())
+        .unwrap();
+    let instance = linker.instantiate(&mut store, &module).unwrap();
+    for name in ["write", "read"] {
+        let function = instance
+            .get_typed_func::<(), i32>(&mut store, name)
+            .unwrap();
+        assert_eq!(function.call(&mut store, ()).unwrap(), 4);
+    }
+    let received = shared.data();
+    let bytes: Vec<_> = received[16..20]
+        .iter()
+        .map(|cell| {
+            // SAFETY: SharedMemory owns these cells and atomic loads avoid a guest race.
+            unsafe { std::sync::atomic::AtomicU8::from_ptr(cell.get()) }
+                .load(std::sync::atomic::Ordering::Relaxed)
+        })
+        .collect();
+    assert_eq!(&bytes, b"pong");
+    assert_eq!(store.data().writes, vec![(7, b"ping".to_vec())]);
+    assert_eq!(store.data().reads, 1);
 }
 
 #[cfg(feature = "wasmtime45-integration")]

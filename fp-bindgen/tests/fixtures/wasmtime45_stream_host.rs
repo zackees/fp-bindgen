@@ -14,15 +14,59 @@ pub(crate) mod resources {
  }
 
 
+/// A stream transfer either made bounded progress or was rejected without trapping the guest.
+pub(crate) enum StreamTransfer { Transferred(usize), Rejected }
+
+enum CallerMemory {
+    Ordinary(wasmtime::Memory),
+    Shared(wasmtime::SharedMemory),
+}
+impl CallerMemory {
+    fn data_size<T>(&self, caller: &wasmtime::Caller<'_, T>) -> usize {
+        match self { Self::Ordinary(memory) => memory.data_size(caller), Self::Shared(memory) => memory.data_size() }
+    }
+    fn read<T>(&self, caller: &wasmtime::Caller<'_, T>, offset: usize, destination: &mut [u8]) -> wasmtime::Result<()> {
+        match self {
+            Self::Ordinary(memory) => Ok(memory.read(caller, offset, destination)?),
+            Self::Shared(memory) => {
+                let end = offset.checked_add(destination.len()).ok_or_else(|| wasmtime::Error::msg("stream guest-memory range overflow"))?;
+                let cells = memory.data().get(offset..end).ok_or_else(|| wasmtime::Error::msg("stream guest-memory range is out of bounds"))?;
+                for (destination, cell) in destination.iter_mut().zip(cells) {
+                    // SAFETY: SharedMemory pins its backing allocation; atomic access avoids racing guest threads.
+                    *destination = unsafe { ::std::sync::atomic::AtomicU8::from_ptr(cell.get()) }.load(::std::sync::atomic::Ordering::Relaxed);
+                }
+                Ok(())
+            }
+        }
+    }
+    fn write<T>(&self, caller: &mut wasmtime::Caller<'_, T>, offset: usize, source: &[u8]) -> wasmtime::Result<()> {
+        match self {
+            Self::Ordinary(memory) => Ok(memory.write(caller, offset, source)?),
+            Self::Shared(memory) => {
+                let end = offset.checked_add(source.len()).ok_or_else(|| wasmtime::Error::msg("stream guest-memory range overflow"))?;
+                let cells = memory.data().get(offset..end).ok_or_else(|| wasmtime::Error::msg("stream guest-memory range is out of bounds"))?;
+                for (source, cell) in source.iter().zip(cells) {
+                    // SAFETY: SharedMemory pins its backing allocation; atomic access avoids racing guest threads.
+                    unsafe { ::std::sync::atomic::AtomicU8::from_ptr(cell.get()) }.store(*source, ::std::sync::atomic::Ordering::Relaxed);
+                }
+                Ok(())
+            }
+        }
+    }
+}
 fn bounded_stream_len(value: i32) -> wasmtime::Result<usize> {
     let value = usize::try_from(value).map_err(|_| wasmtime::Error::msg("negative stream chunk length"))?;
     if value <= 65536usize { Ok(value) } else { Err(wasmtime::Error::msg(format!("stream chunk exceeds 65536 bytes: {value}"))) }
 }
 fn guest_memory_offset(value: i32) -> usize { value as u32 as usize }
-fn caller_memory<T>(caller: &mut wasmtime::Caller<'_, T>) -> wasmtime::Result<wasmtime::Memory> {
-    caller.get_export("memory").and_then(|export| export.into_memory()).ok_or_else(|| wasmtime::Error::msg("stream controls require exported guest memory named `memory`"))
+fn caller_memory<T>(caller: &mut wasmtime::Caller<'_, T>) -> wasmtime::Result<CallerMemory> {
+    match caller.get_export("memory") {
+        Some(wasmtime::Extern::Memory(memory)) => Ok(CallerMemory::Ordinary(memory)),
+        Some(wasmtime::Extern::SharedMemory(memory)) => Ok(CallerMemory::Shared(memory)),
+        _ => Err(wasmtime::Error::msg("stream controls require exported guest memory named `memory`")),
+    }
 }
-fn checked_guest_memory_range<T>(memory: &wasmtime::Memory, caller: &wasmtime::Caller<'_, T>, offset: usize, length: usize) -> wasmtime::Result<()> {
+fn checked_guest_memory_range<T>(memory: &CallerMemory, caller: &wasmtime::Caller<'_, T>, offset: usize, length: usize) -> wasmtime::Result<()> {
     let end = offset.checked_add(length).ok_or_else(|| wasmtime::Error::msg("stream guest-memory range overflow"))?;
     if end <= memory.data_size(caller) { Ok(()) } else { Err(wasmtime::Error::msg("stream guest-memory range is out of bounds")) }
 }
@@ -33,10 +77,10 @@ fn checked_stream_count(transferred: usize, requested: usize) -> wasmtime::Resul
 
 pub(crate) trait KernalApiV1Imports {
 
-    /// Transfer one bounded caller-memory chunk. The host registry validates the raw stream handle.
-    fn stream_read(&mut self, stream: u64, destination: &mut [u8]) -> wasmtime::Result<usize>;
-    /// Transfer one bounded caller-memory chunk. The host registry validates the raw stream handle.
-    fn stream_write(&mut self, stream: u64, source: &[u8]) -> wasmtime::Result<usize>;
+    /// Transfer one bounded caller-memory chunk. Return `StreamTransfer::Rejected` for a guest-visible rejection.
+    fn stream_read(&mut self, stream: u64, destination: &mut [u8]) -> wasmtime::Result<StreamTransfer>;
+    /// Transfer one bounded caller-memory chunk. Return `StreamTransfer::Rejected` for a guest-visible rejection.
+    fn stream_write(&mut self, stream: u64, source: &[u8]) -> wasmtime::Result<StreamTransfer>;
     /// Atomically revoke a stream handle through the host's canonical scope/generation registry.
     fn stream_close(&mut self, stream: u64) -> wasmtime::Result<i32>;
 }
@@ -55,7 +99,7 @@ where
             let memory = caller_memory(&mut caller)?;
             checked_guest_memory_range(&memory, &caller, destination, destination_len)?;
             let mut chunk = ::std::vec![0; destination_len];
-            let transferred = caller.data_mut().stream_read(stream as u64, &mut chunk)?;
+            let transferred = match caller.data_mut().stream_read(stream as u64, &mut chunk)? { StreamTransfer::Rejected => return Ok(-1), StreamTransfer::Transferred(transferred) => transferred };
             checked_stream_count(transferred, destination_len)?;
             memory.write(&mut caller, destination, &chunk[..transferred])?;
             Ok(transferred as i32)
@@ -71,7 +115,7 @@ where
             checked_guest_memory_range(&memory, &caller, source, source_len)?;
             let mut chunk = ::std::vec![0; source_len];
             memory.read(&caller, source, &mut chunk)?;
-            let transferred = caller.data_mut().stream_write(stream as u64, &chunk)?;
+            let transferred = match caller.data_mut().stream_write(stream as u64, &chunk)? { StreamTransfer::Rejected => return Ok(-1), StreamTransfer::Transferred(transferred) => transferred };
             checked_stream_count(transferred, source_len)?;
             Ok(transferred as i32)
         },
