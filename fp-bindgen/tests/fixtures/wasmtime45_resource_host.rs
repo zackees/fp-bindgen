@@ -26,6 +26,8 @@ pub(crate) mod resources {
 
 pub(crate) trait KernalApiV1Imports {
     fn open_entry(&mut self, archive: resources::Archive) -> wasmtime::Result<resources::Entry>;
+    /// Atomically revoke this guest-owned handle through the host's canonical scope/generation registry.
+    fn resource_release_archive(&mut self, resource: resources::Archive) -> wasmtime::Result<i32>;
 }
 
 pub(crate) fn link_kernal_api_v1<T>(linker: &mut wasmtime::Linker<T>) -> wasmtime::Result<()>
@@ -42,15 +44,22 @@ where
             Ok(resources::Entry::encode_i64(caller.data_mut().open_entry(archive)?))
         },
     )?;
+    linker.func_wrap(
+        "kernal-api:v1",
+        "resource_release_archive",
+        |mut caller: wasmtime::Caller<'_, T>, resource: i64| -> wasmtime::Result<i32> {
+            caller.data_mut().resource_release_archive(resources::Archive::decode_i64(resource)?)
+        },
+    )?;
     Ok(())
 }
 
-pub(crate) fn invoke_visit_archive<T>(
+pub(crate) fn invoke_visit_entry<T>(
     store: &mut wasmtime::Store<T>,
     instance: &wasmtime::Instance,
-    archive: resources::Archive,
+    entry: resources::Entry,
 ) -> wasmtime::Result<resources::Entry> {
-    let function = instance.get_typed_func::<i64, i64>(&mut *store, "visit_archive")?;
-    let raw = function.call(&mut *store, resources::Archive::encode_i64(archive))?;
+    let function = instance.get_typed_func::<i64, i64>(&mut *store, "visit_entry")?;
+    let raw = function.call(&mut *store, resources::Entry::encode_i64(entry))?;
     resources::Entry::decode_i64(raw)
 }

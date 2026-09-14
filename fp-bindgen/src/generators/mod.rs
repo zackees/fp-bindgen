@@ -335,6 +335,15 @@ pub enum WasmtimeCoreWasmError {
         direction: &'static str,
         function: String,
     },
+    OwnedResourceExport {
+        function: String,
+        resource: String,
+    },
+    ResourceReleaseNameCollision {
+        release: String,
+        first_resource: String,
+        second_resource: String,
+    },
     UnsupportedValue {
         direction: &'static str,
         function: String,
@@ -373,6 +382,18 @@ impl Display for WasmtimeCoreWasmError {
             } => write!(
                 f,
                 "{direction} function `{function}` conflicts with a reserved Wasmtime Core Wasm operation control"
+            ),
+            Self::OwnedResourceExport { function, resource } => write!(
+                f,
+                "export `{function}` uses owned resource `{resource}`; Core Wasm v1 requires an explicit transfer declaration before owned resources may cross host-to-guest exports"
+            ),
+            Self::ResourceReleaseNameCollision {
+                release,
+                first_resource,
+                second_resource,
+            } => write!(
+                f,
+                "owned resources `{first_resource}` and `{second_resource}` both generate reserved release control `{release}`"
             ),
             Self::UnsupportedValue {
                 direction,

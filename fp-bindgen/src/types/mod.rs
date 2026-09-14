@@ -21,13 +21,46 @@ pub use type_ident::TypeIdent;
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Resource {
     pub ident: TypeIdent,
+    /// Whether this declaration transfers an owned, host-issued capability
+    /// into guest code.  The Core Wasm backend gives these handles a release
+    /// control and never treats their integer representation as a value.
+    pub ownership: ResourceOwnership,
+}
+
+/// The ownership contract of an opaque host resource.
+///
+/// `Transport` preserves the original nominal-handle lowering for protocols
+/// which already own their lifecycle. `Owned` asks a backend to generate an
+/// explicit release path; it must not be lowered by value generators.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ResourceOwnership {
+    Transport,
+    Owned,
 }
 
 impl Resource {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             ident: TypeIdent::from(name.into()),
+            ownership: ResourceOwnership::Transport,
         }
+    }
+
+    /// Declares a host-owned capability whose generated guest handle releases
+    /// itself exactly once, either explicitly or on normal Rust drop.
+    ///
+    /// Store/trap teardown and generation validation remain host policy: the
+    /// generated release import delegates atomically to the consuming host's
+    /// canonical resource registry.
+    pub fn owned(name: impl Into<String>) -> Self {
+        Self {
+            ident: TypeIdent::from(name.into()),
+            ownership: ResourceOwnership::Owned,
+        }
+    }
+
+    pub fn is_owned(&self) -> bool {
+        self.ownership == ResourceOwnership::Owned
     }
 }
 

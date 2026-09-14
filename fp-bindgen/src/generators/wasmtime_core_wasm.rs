@@ -8,8 +8,9 @@ use crate::{
     functions::FunctionList,
     generators::WasmtimeCoreWasmError,
     primitives::Primitive,
-    types::{Type, TypeIdent, TypeMap},
+    types::{ResourceOwnership, Type, TypeIdent, TypeMap},
 };
+use inflector::Inflector;
 use std::{collections::BTreeSet, fs, path::Path};
 
 const ABI_NAMESPACE: &str = "kernal-api:v1";
@@ -71,6 +72,22 @@ fn render_bindings(
     let imports = lower_functions(import_functions, types, "import", true)?;
     let exports = lower_functions(export_functions, types, "export", false)?;
     validate_type_definitions(types)?;
+    validate_owned_resource_release_names(types)?;
+    for function in &exports {
+        for ty in function
+            .args
+            .iter()
+            .map(|argument| argument.ty)
+            .chain(function.return_type)
+        {
+            if ty.owned_resource {
+                return Err(WasmtimeCoreWasmError::OwnedResourceExport {
+                    function: function.name.to_owned(),
+                    resource: ty.semantic.to_owned(),
+                });
+            }
+        }
+    }
     Ok(RenderedBindings {
         guest_cargo: render_guest_cargo(),
         guest_source: render_guest_source(&imports, &exports, types),
@@ -105,7 +122,9 @@ fn lower_functions<'a>(
                 function: function.name.clone(),
             });
         }
-        if OPERATION_CONTROLS.contains(&function.name.as_str()) {
+        if OPERATION_CONTROLS.contains(&function.name.as_str())
+            || owned_resource_release_names(types).contains(&function.name)
+        {
             return Err(WasmtimeCoreWasmError::ReservedOperationControl {
                 direction,
                 function: function.name.clone(),
@@ -141,6 +160,36 @@ fn lower_functions<'a>(
         });
     }
     Ok(lowered)
+}
+
+fn owned_resource_release_names(types: &TypeMap) -> BTreeSet<String> {
+    types
+        .values()
+        .filter_map(|ty| match ty {
+            Type::Resource(resource) if resource.is_owned() => {
+                Some(resource_release_import_name(resource))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn validate_owned_resource_release_names(types: &TypeMap) -> Result<(), WasmtimeCoreWasmError> {
+    let mut releases = std::collections::BTreeMap::new();
+    for resource in types.values().filter_map(|ty| match ty {
+        Type::Resource(resource) if resource.is_owned() => Some(resource),
+        _ => None,
+    }) {
+        let release = resource_release_import_name(resource);
+        if let Some(first_resource) = releases.insert(release.clone(), resource.ident.to_string()) {
+            return Err(WasmtimeCoreWasmError::ResourceReleaseNameCollision {
+                release,
+                first_resource,
+                second_resource: resource.ident.to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn validate_type_definitions(types: &TypeMap) -> Result<(), WasmtimeCoreWasmError> {
@@ -182,10 +231,15 @@ fn lower_value_type<'a>(
         return Err(unsupported_value(direction, function, position, ty));
     }
     if matches!(types.get(ty), Some(Type::Resource(_))) {
+        let owned_resource = matches!(
+            types.get(ty),
+            Some(Type::Resource(resource)) if resource.ownership == ResourceOwnership::Owned
+        );
         return Ok(LoweredType {
             semantic: &ty.name,
             abi: "i64",
             resource: true,
+            owned_resource,
         });
     }
     ty.as_primitive()
@@ -224,6 +278,7 @@ struct LoweredType<'a> {
     semantic: &'a str,
     abi: &'static str,
     resource: bool,
+    owned_resource: bool,
 }
 
 impl LoweredType<'_> {
@@ -269,6 +324,7 @@ fn lower_primitive(primitive: Primitive) -> Option<LoweredType<'static>> {
         semantic,
         abi,
         resource: false,
+        owned_resource: false,
     })
 }
 
@@ -289,6 +345,13 @@ fn render_guest_source(
     types: &TypeMap,
 ) -> String {
     let has_async_imports = import_functions.iter().any(|function| function.is_async);
+    let has_async_owned_borrow = import_functions.iter().any(|function| {
+        function.is_async
+            && function
+                .args
+                .iter()
+                .any(|argument| argument.ty.owned_resource)
+    });
     let raw_imports = import_functions
         .iter()
         .map(render_guest_raw_import)
@@ -296,7 +359,7 @@ fn render_guest_source(
         .join("\n");
     let imports = import_functions
         .iter()
-        .map(render_guest_typed_import)
+        .map(|function| render_guest_typed_import(function, has_async_owned_borrow))
         .collect::<Vec<_>>()
         .join("\n\n");
     let export_fields = export_functions
@@ -313,8 +376,9 @@ fn render_guest_source(
         .then(render_guest_operation_raw_imports)
         .unwrap_or_default();
     let operation_support = has_async_imports
-        .then(render_guest_operation_support)
+        .then(|| render_guest_operation_support(has_async_owned_borrow))
         .unwrap_or_default();
+    let resource_release_raw_imports = render_guest_resource_release_raw_imports(types);
     let mut import_uses = if has_async_imports {
         "raw_imports, AbiError, PendingOperation"
     } else {
@@ -338,6 +402,8 @@ fn render_guest_source(
          pub enum AbiError {{\n\
          \u{20}   InvalidBoolean(i32),\n\
          \u{20}   OutOfRange {{ ty: &'static str, value: i32 }},\n\
+         \u{20}   ResourceClosed {{ resource: &'static str }},\n\
+         \u{20}   ResourceReleaseRejected {{ resource: &'static str, status: i32 }},\n\
          {operation_error_variants}\
          }}\n\n\
          #[derive(Clone, Debug, Eq, PartialEq)]\n\
@@ -372,6 +438,7 @@ fn render_guest_source(
          \u{20}   extern \"C\" {{\n\
          {raw_imports}\n\
          {operation_raw_imports}\n\
+         {resource_release_raw_imports}\n\
          \u{20}   }}\n\
          }}\n\n\
          {operation_support}\n\
@@ -394,6 +461,16 @@ fn render_guest_resource_types(types: &TypeMap) -> String {
     let definitions = types
         .values()
         .filter_map(|ty| match ty {
+            Type::Resource(resource) if resource.is_owned() => Some(format!(
+                "#[derive(Debug, Eq, Hash, PartialEq)]\npub struct {}(::core::option::Option<u64>);\n\nimpl {} {{\n    pub(crate) fn from_abi(raw: u64) -> Self {{ Self(::core::option::Option::Some(raw)) }}\n    pub(crate) fn decode_i64(raw: i64) -> ::core::result::Result<Self, super::AbiError> {{ ::core::result::Result::Ok(Self::from_abi(raw as u64)) }}\n    pub(crate) fn encode_i64(&self) -> ::core::result::Result<i64, super::AbiError> {{ self.0.map(|raw| raw as i64).ok_or(super::AbiError::ResourceClosed {{ resource: \"{}\" }}) }}\n    pub fn close(mut self) -> ::core::result::Result<(), super::AbiError> {{ self.release() }}\n    fn release(&mut self) -> ::core::result::Result<(), super::AbiError> {{ let raw = self.0.take().ok_or(super::AbiError::ResourceClosed {{ resource: \"{}\" }})?; let status = unsafe {{ super::raw_imports::{}(raw as i64) }}; if status == 0 {{ ::core::result::Result::Ok(()) }} else {{ ::core::result::Result::Err(super::AbiError::ResourceReleaseRejected {{ resource: \"{}\", status }}) }} }}\n}}\n\nimpl ::core::ops::Drop for {} {{ fn drop(&mut self) {{ if self.0.is_some() {{ let _ = self.release(); }} }} }}\n\n",
+                resource.ident,
+                resource.ident,
+                resource.ident,
+                resource.ident,
+                guest_resource_release_raw_name(resource),
+                resource.ident,
+                resource.ident,
+            )),
             Type::Resource(resource) => Some(format!(
                 "#[repr(transparent)]\n#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]\npub struct {}(u64);\n\nimpl {} {{\n    pub(crate) fn from_abi(raw: u64) -> Self {{ Self(raw) }}\n    pub(crate) fn into_abi(self) -> u64 {{ self.0 }}\n    pub(crate) fn decode_i64(raw: i64) -> ::std::result::Result<Self, super::AbiError> {{ ::std::result::Result::Ok(Self::from_abi(raw as u64)) }}\n    pub(crate) fn encode_i64(self) -> i64 {{ self.into_abi() as i64 }}\n}}\n\n",
                 resource.ident, resource.ident
@@ -407,6 +484,31 @@ fn render_guest_resource_types(types: &TypeMap) -> String {
     } else {
         format!("pub mod resources {{\n{} }}\n\n", indent(&definitions, 4))
     }
+}
+
+fn resource_release_import_name(resource: &crate::types::Resource) -> String {
+    format!("resource_release_{}", resource.ident.name.to_snake_case())
+}
+
+fn guest_resource_release_raw_name(resource: &crate::types::Resource) -> String {
+    format!(
+        "__kernal_api_v1_import_{}",
+        resource_release_import_name(resource)
+    )
+}
+
+fn render_guest_resource_release_raw_imports(types: &TypeMap) -> String {
+    types
+        .values()
+        .filter_map(|ty| match ty {
+            Type::Resource(resource) if resource.is_owned() => Some(format!(
+                "        #[link_name = \"{}\"]\n        pub(super) fn {}(resource: i64) -> i32;\n",
+                resource_release_import_name(resource),
+                guest_resource_release_raw_name(resource),
+            )),
+            _ => None,
+        })
+        .collect()
 }
 
 fn render_guest_raw_import(function: &LoweredFunction<'_>) -> String {
@@ -423,11 +525,23 @@ fn render_guest_raw_import(function: &LoweredFunction<'_>) -> String {
     )
 }
 
-fn render_guest_typed_import(function: &LoweredFunction<'_>) -> String {
+fn render_guest_typed_import(
+    function: &LoweredFunction<'_>,
+    has_async_owned_borrow: bool,
+) -> String {
     let call_arguments = function
         .args
         .iter()
-        .map(|argument| format!("super::{}", encode_expression(argument.name, argument.ty)))
+        .map(|argument| {
+            if argument.ty.owned_resource {
+                format!(
+                    "super::resources::{}::encode_i64({})?",
+                    argument.ty.semantic, argument.name
+                )
+            } else {
+                format!("super::{}", encode_expression(argument.name, argument.ty))
+            }
+        })
         .collect::<Vec<_>>()
         .join(", ");
     let call = format!(
@@ -435,11 +549,24 @@ fn render_guest_typed_import(function: &LoweredFunction<'_>) -> String {
         raw_import_name(function)
     );
     if function.is_async {
+        let borrows_owned = function
+            .args
+            .iter()
+            .any(|argument| argument.ty.owned_resource);
+        let pending = if has_async_owned_borrow {
+            if borrows_owned {
+                format!("PendingOperation<'a, {}>", semantic_return(function))
+            } else {
+                format!("PendingOperation<'static, {}>", semantic_return(function))
+            }
+        } else {
+            format!("PendingOperation<{}>", semantic_return(function))
+        };
         return format!(
-            "    pub fn {}({}) -> Result<PendingOperation<{}>, AbiError> {{\n        let operation = {call};\n        Ok(PendingOperation::new(operation as u64, {}))\n    }}",
+            "    pub fn {}{}({}) -> Result<{pending}, AbiError> {{\n        let operation = {call};\n        Ok(PendingOperation::new(operation as u64, {}))\n    }}",
             function.name,
-            render_semantic_arguments(function),
-            semantic_return(function),
+            if borrows_owned { "<'a>" } else { "" },
+            render_guest_semantic_arguments(function),
             render_operation_result_decoder(function),
         );
     }
@@ -453,9 +580,28 @@ fn render_guest_typed_import(function: &LoweredFunction<'_>) -> String {
     format!(
         "    pub fn {}({}) -> Result<{}, AbiError> {{\n        {body}\n    }}",
         function.name,
-        render_semantic_arguments(function),
+        render_guest_semantic_arguments(function),
         semantic_return(function)
     )
+}
+
+fn render_guest_semantic_arguments(function: &LoweredFunction<'_>) -> String {
+    function
+        .args
+        .iter()
+        .map(|argument| {
+            if argument.ty.owned_resource {
+                let borrow = if function.is_async { "&'a " } else { "&" };
+                format!(
+                    "{}: {borrow}resources::{}",
+                    argument.name, argument.ty.semantic
+                )
+            } else {
+                format!("{}: {}", argument.name, argument.ty.rust_type())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn render_guest_operation_raw_imports() -> String {
@@ -463,9 +609,23 @@ fn render_guest_operation_raw_imports() -> String {
         .to_owned()
 }
 
-fn render_guest_operation_support() -> String {
-    "pub struct PendingOperation<T> {\n    operation: Option<u64>,\n    decode: fn(i64) -> Result<T, AbiError>,\n}\n\nimpl<T> PendingOperation<T> {\n    fn new(operation: u64, decode: fn(i64) -> Result<T, AbiError>) -> Self { Self { operation: Some(operation), decode } }\n\n    pub fn poll(&mut self) -> Result<Option<T>, AbiError> {\n        let operation = self.operation.ok_or(AbiError::OperationCancelled)?;\n        match unsafe { raw_imports::__kernal_api_v1_import_poll_operation(operation as i64) } {\n            0 => Ok(None),\n            1 => {\n                self.operation = None;\n                (self.decode)(unsafe { raw_imports::__kernal_api_v1_import_take_operation_result(operation as i64) }).map(Some)\n            }\n            2 => { self.operation = None; Err(AbiError::OperationCancelled) }\n            state => Err(AbiError::InvalidOperationState(state)),\n        }\n    }\n\n    pub fn yield_now(&self) -> Result<(), AbiError> {\n        let operation = self.operation.ok_or(AbiError::OperationCancelled)?;\n        unsafe { raw_imports::__kernal_api_v1_import_yield_operation(operation as i64) };\n        Ok(())\n    }\n\n    pub fn cancel(&mut self) -> Result<(), AbiError> {\n        let operation = self.operation.take().ok_or(AbiError::OperationCancelled)?;\n        unsafe { raw_imports::__kernal_api_v1_import_cancel_operation(operation as i64) };\n        Ok(())\n    }\n}\n\nimpl<T> Drop for PendingOperation<T> {\n    fn drop(&mut self) {\n        if let Some(operation) = self.operation.take() {\n            unsafe { raw_imports::__kernal_api_v1_import_cancel_operation(operation as i64) };\n        }\n    }\n}\n\n"
-        .to_owned()
+fn render_guest_operation_support(has_owned_borrows: bool) -> String {
+    let struct_generics = if has_owned_borrows { "<'a, T>" } else { "<T>" };
+    let impl_generics = if has_owned_borrows { "<'a, T>" } else { "<T>" };
+    let type_generics = if has_owned_borrows { "<'a, T>" } else { "<T>" };
+    let marker = if has_owned_borrows {
+        "    _borrow: ::std::marker::PhantomData<&'a ()>,\n"
+    } else {
+        ""
+    };
+    let initialize_marker = if has_owned_borrows {
+        ", _borrow: ::std::marker::PhantomData"
+    } else {
+        ""
+    };
+    format!(
+        "pub struct PendingOperation{struct_generics} {{\n    operation: Option<u64>,\n    decode: fn(i64) -> Result<T, AbiError>,\n{marker}}}\n\nimpl{impl_generics} PendingOperation{type_generics} {{\n    fn new(operation: u64, decode: fn(i64) -> Result<T, AbiError>) -> Self {{ Self {{ operation: Some(operation), decode{initialize_marker} }} }}\n\n    pub fn poll(&mut self) -> Result<Option<T>, AbiError> {{\n        let operation = self.operation.ok_or(AbiError::OperationCancelled)?;\n        match unsafe {{ raw_imports::__kernal_api_v1_import_poll_operation(operation as i64) }} {{\n            0 => Ok(None),\n            1 => {{\n                self.operation = None;\n                (self.decode)(unsafe {{ raw_imports::__kernal_api_v1_import_take_operation_result(operation as i64) }}).map(Some)\n            }}\n            2 => {{ self.operation = None; Err(AbiError::OperationCancelled) }}\n            state => Err(AbiError::InvalidOperationState(state)),\n        }}\n    }}\n\n    pub fn yield_now(&self) -> Result<(), AbiError> {{\n        let operation = self.operation.ok_or(AbiError::OperationCancelled)?;\n        unsafe {{ raw_imports::__kernal_api_v1_import_yield_operation(operation as i64) }};\n        Ok(())\n    }}\n\n    pub fn cancel(&mut self) -> Result<(), AbiError> {{\n        let operation = self.operation.take().ok_or(AbiError::OperationCancelled)?;\n        unsafe {{ raw_imports::__kernal_api_v1_import_cancel_operation(operation as i64) }};\n        Ok(())\n    }}\n}}\n\nimpl{impl_generics} Drop for PendingOperation{type_generics} {{\n    fn drop(&mut self) {{\n        if let Some(operation) = self.operation.take() {{\n            unsafe {{ raw_imports::__kernal_api_v1_import_cancel_operation(operation as i64) }};\n        }}\n    }}\n}}\n\n"
+    )
 }
 
 fn render_guest_export_field(function: &LoweredFunction<'_>) -> String {
@@ -537,6 +697,8 @@ fn render_host_linker(
     let operation_registrations = has_async_imports
         .then(render_host_operation_registrations)
         .unwrap_or_default();
+    let resource_trait_methods = render_host_resource_release_trait_methods(types);
+    let resource_registrations = render_host_resource_release_registrations(types);
     let invocations = export_functions
         .iter()
         .map(render_host_invocation)
@@ -548,13 +710,41 @@ fn render_host_linker(
          // Host trait and invocation helpers use semantic scalar and resource types.\n\n\
          {resources}\
          {helpers}\n\n\
-         pub(crate) trait KernalApiV1Imports {{\n{trait_methods}\n{operation_trait_methods}}}\n\n\
+         pub(crate) trait KernalApiV1Imports {{\n{trait_methods}\n{operation_trait_methods}{resource_trait_methods}}}\n\n\
          pub(crate) fn link_kernal_api_v1<T>(linker: &mut wasmtime::Linker<T>) -> wasmtime::Result<()>\n\
          where\n\
          \u{20}   T: KernalApiV1Imports + Send + 'static,\n\
-         {{\n{registrations}\n{operation_registrations}    Ok(())\n}}\n\n\
+         {{\n{registrations}\n{operation_registrations}{resource_registrations}    Ok(())\n}}\n\n\
          {invocations}\n"
     )
+}
+
+fn render_host_resource_release_trait_methods(types: &TypeMap) -> String {
+    types
+        .values()
+        .filter_map(|ty| match ty {
+            Type::Resource(resource) if resource.is_owned() => Some(format!(
+                "    /// Atomically revoke this guest-owned handle through the host's canonical scope/generation registry.\n    fn {}(&mut self, resource: resources::{}) -> wasmtime::Result<i32>;\n",
+                resource_release_import_name(resource), resource.ident
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+fn render_host_resource_release_registrations(types: &TypeMap) -> String {
+    types
+        .values()
+        .filter_map(|ty| match ty {
+            Type::Resource(resource) if resource.is_owned() => Some(format!(
+                "    linker.func_wrap(\n        \"{ABI_NAMESPACE}\",\n        \"{}\",\n        |mut caller: wasmtime::Caller<'_, T>, resource: i64| -> wasmtime::Result<i32> {{\n            caller.data_mut().{}(resources::{}::decode_i64(resource)?)\n        }},\n    )?;\n",
+                resource_release_import_name(resource),
+                resource_release_import_name(resource),
+                resource.ident,
+            )),
+            _ => None,
+        })
+        .collect()
 }
 
 fn render_host_resource_types(types: &TypeMap) -> String {
@@ -765,8 +955,9 @@ fn render_manifest(
         .values()
         .filter_map(|ty| match ty {
             Type::Resource(resource) => Some(format!(
-                "[[resources]]\nname = \"{}\"\nkind = \"opaque_host_handle\"\nabi = \"i64\"\n\n",
-                resource.ident
+                "[[resources]]\nname = \"{}\"\nkind = \"opaque_host_handle\"\nownership = \"{}\"\nabi = \"i64\"\n\n",
+                resource.ident,
+                if resource.is_owned() { "owned" } else { "transport" },
             )),
             _ => None,
         })
@@ -786,9 +977,23 @@ fn render_manifest(
     } else {
         "\n".to_owned()
     };
+    let resource_controls = render_resource_release_manifest_records(types);
     format!(
-        "schema = \"{SCHEMA}\"\nschema_revision = {SCHEMA_REVISION}\ngenerator_revision = {GENERATOR_REVISION}\nabi_version = {ABI_VERSION}\nnamespace = \"{ABI_NAMESPACE}\"\n\n{resources}{imports}{operation_controls}{exports}"
+        "schema = \"{SCHEMA}\"\nschema_revision = {SCHEMA_REVISION}\ngenerator_revision = {GENERATOR_REVISION}\nabi_version = {ABI_VERSION}\nnamespace = \"{ABI_NAMESPACE}\"\n\n{resources}{imports}{operation_controls}{resource_controls}{exports}"
     )
+}
+
+fn render_resource_release_manifest_records(types: &TypeMap) -> String {
+    types
+        .values()
+        .filter_map(|ty| match ty {
+            Type::Resource(resource) if resource.is_owned() => Some(format!(
+                "[[imports]]\nnamespace = \"{ABI_NAMESPACE}\"\nname = \"{}\"\ndirection = \"guest-to-host\"\ngenerated = true\nresource_control = \"release\"\nparams = [{{ semantic = \"{}\", abi = \"i64\", kind = \"resource\" }}]\nresults = [{{ semantic = \"i32\", abi = \"i32\" }}]\n\n",
+                resource_release_import_name(resource), resource.ident
+            )),
+            _ => None,
+        })
+        .collect()
 }
 
 fn render_operation_control_manifest_records() -> String {
@@ -1057,6 +1262,15 @@ mod tests {
             .collect()
     }
 
+    fn owned_resource_types() -> TypeMap {
+        let mut types = resource_types();
+        types.insert(
+            TypeIdent::from("Archive"),
+            Type::Resource(crate::types::Resource::owned("Archive")),
+        );
+        types
+    }
+
     #[test]
     fn resources_lower_to_nominal_signatures_and_i64_in_both_directions() {
         let mut imports = FunctionList::new();
@@ -1150,6 +1364,70 @@ mod tests {
     }
 
     #[test]
+    fn owned_resources_borrow_until_async_completion_and_emit_release_contract() {
+        let mut imports = FunctionList::new();
+        imports.add_function("async fn next_entry(archive: Archive) -> Entry;");
+        let rendered =
+            render_bindings(&imports, &FunctionList::new(), &owned_resource_types()).unwrap();
+        syn::parse_file(&rendered.guest_source).unwrap();
+        syn::parse_file(&rendered.host_linker).unwrap();
+        assert!(rendered
+            .guest_source
+            .contains("pub struct Archive(::core::option::Option<u64>);"));
+        assert!(rendered.guest_source.contains("pub fn close(mut self)"));
+        assert!(rendered
+            .guest_source
+            .contains("impl ::core::ops::Drop for Archive"));
+        assert!(rendered
+            .guest_source
+            .contains("pub struct PendingOperation<'a, T>"));
+        assert!(rendered.guest_source.contains("pub fn next_entry<'a>(archive: &'a resources::Archive) -> Result<PendingOperation<'a, resources::Entry>, AbiError>"));
+        assert!(rendered.guest_source.contains("resource_release_archive"));
+        assert!(rendered.host_linker.contains("fn resource_release_archive(&mut self, resource: resources::Archive) -> wasmtime::Result<i32>;"));
+        let manifest: toml::Value = rendered.manifest.parse().unwrap();
+        assert_eq!(
+            manifest["resources"][0]["ownership"].as_str(),
+            Some("owned")
+        );
+        assert_eq!(
+            manifest["imports"][5]["name"].as_str(),
+            Some("resource_release_archive")
+        );
+        assert_eq!(
+            manifest["imports"][5]["resource_control"].as_str(),
+            Some("release")
+        );
+    }
+
+    #[test]
+    fn owned_resources_reject_implicit_export_transfer_and_control_collisions() {
+        let mut exports = FunctionList::new();
+        exports.add_function("fn pass(archive: Archive) -> Entry;");
+        assert!(matches!(
+            render_bindings(&FunctionList::new(), &exports, &owned_resource_types()),
+            Err(WasmtimeCoreWasmError::OwnedResourceExport { .. })
+        ));
+        let mut imports = FunctionList::new();
+        imports.add_function("fn resource_release_archive();");
+        assert!(matches!(
+            render_bindings(&imports, &FunctionList::new(), &owned_resource_types()),
+            Err(WasmtimeCoreWasmError::ReservedOperationControl { .. })
+        ));
+
+        let mut colliding = TypeMap::new();
+        for name in ["HTTPServer", "HttpServer"] {
+            colliding.insert(
+                TypeIdent::from(name),
+                Type::Resource(crate::types::Resource::owned(name)),
+            );
+        }
+        assert!(matches!(
+            render_bindings(&FunctionList::new(), &FunctionList::new(), &colliding),
+            Err(WasmtimeCoreWasmError::ResourceReleaseNameCollision { .. })
+        ));
+    }
+
+    #[test]
     fn resource_signatures_require_declarations_and_reject_value_containers() {
         for declaration in [
             "fn unknown(value: Undeclared);",
@@ -1197,8 +1475,8 @@ mod tests {
         let mut imports = FunctionList::new();
         imports.add_function("fn open_entry(archive: Archive) -> Entry;");
         let mut exports = FunctionList::new();
-        exports.add_function("fn visit_archive(archive: Archive) -> Entry;");
-        let rendered = render_bindings(&imports, &exports, &resource_types()).unwrap();
+        exports.add_function("fn visit_entry(entry: Entry) -> Entry;");
+        let rendered = render_bindings(&imports, &exports, &owned_resource_types()).unwrap();
         assert_eq!(
             rendered.host_linker,
             include_str!("../../tests/fixtures/wasmtime45_resource_host.rs")
