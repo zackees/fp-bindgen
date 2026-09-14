@@ -35,7 +35,7 @@ pub enum BindingsType {
     #[cfg(feature = "generators")]
     RustWasmer2WasiRuntime,
     #[cfg(feature = "wasmtime-core-wasm")]
-    /// Generates the scalar-only `kernal-api:v1` Core Wasm ABI for Wasmtime 45 hosts.
+    /// Generates the scalar and opaque-resource `kernal-api:v1` Core Wasm ABI for Wasmtime 45 hosts.
     RustWasmtimeCoreWasm,
     #[cfg(feature = "generators")]
     TsRuntime(TsRuntimeConfig),
@@ -320,10 +320,10 @@ impl Default for TsRuntimeConfig {
 #[cfg(feature = "generators")]
 impl TsRuntimeConfig {}
 
-/// A validation or filesystem error from the scalar Wasmtime Core Wasm generator.
+/// A validation or filesystem error from the Wasmtime Core Wasm generator.
 ///
 /// This generator rejects bulk values and async exports before it creates an output
-/// directory. Async scalar imports use the explicit operation-handle protocol.
+/// directory. Async scalar and resource imports use the explicit operation-handle protocol.
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum WasmtimeCoreWasmError {
@@ -365,7 +365,7 @@ impl Display for WasmtimeCoreWasmError {
                 function,
             } => write!(
                 f,
-                "{direction} function `{function}` is async; the Wasmtime Core Wasm v0 ABI supports async scalar imports only"
+                "{direction} function `{function}` is async; the Wasmtime Core Wasm v1 ABI supports async imports only"
             ),
             Self::ReservedOperationControl {
                 direction,
@@ -381,11 +381,11 @@ impl Display for WasmtimeCoreWasmError {
                 ty,
             } => write!(
                 f,
-                "{direction} function `{function}` has unsupported {position} type `{ty}`; the Wasmtime Core Wasm v0 ABI accepts only scalar values"
+                "{direction} function `{function}` has unsupported {position} type `{ty}`; the Wasmtime Core Wasm v1 ABI accepts scalar values and declared opaque resources"
             ),
             Self::UnsupportedTypeDefinition { name, ty } => write!(
                 f,
-                "type definition `{name}` (`{ty}`) is unsupported; the Wasmtime Core Wasm v0 ABI has no bulk or user-defined types"
+                "type definition `{name}` (`{ty}`) is unsupported; the Wasmtime Core Wasm v1 ABI accepts primitives and opaque resource declarations, without bulk values"
             ),
             Self::InvalidResourceName { name } => write!(
                 f,
@@ -409,7 +409,7 @@ impl Error for WasmtimeCoreWasmError {
     }
 }
 
-/// Generates the scalar-only `kernal-api:v1` Core Wasm ABI and reports validation errors.
+/// Generates the scalar and opaque-resource `kernal-api:v1` Core Wasm ABI and reports validation errors.
 ///
 /// Unlike the historical binding targets, this entry point never falls back to a FatPtr or
 /// serialization path. Invalid declarations are rejected before any output is written.

@@ -1,11 +1,11 @@
-//! Deterministic scalar-only Core Wasm bindings for a Wasmtime 45 host.
+//! Deterministic scalar and opaque-resource Core Wasm bindings for a Wasmtime 45 host.
 //!
 //! This target is intentionally independent from the legacy Wasmer generators.
 //! It emits source text only and never selects an allocation, serialization, or
 //! async transport protocol, except for explicit scalar operation handles on imports.
 
 use crate::{
-    functions::{Function, FunctionList},
+    functions::FunctionList,
     generators::WasmtimeCoreWasmError,
     primitives::Primitive,
     types::{Type, TypeIdent, TypeMap},
@@ -68,22 +68,36 @@ fn render_bindings(
     export_functions: &FunctionList,
     types: &TypeMap,
 ) -> Result<RenderedBindings, WasmtimeCoreWasmError> {
-    validate_functions(import_functions, "import", true)?;
-    validate_functions(export_functions, "export", false)?;
+    let imports = lower_functions(import_functions, types, "import", true)?;
+    let exports = lower_functions(export_functions, types, "export", false)?;
     validate_type_definitions(types)?;
     Ok(RenderedBindings {
         guest_cargo: render_guest_cargo(),
-        guest_source: render_guest_source(import_functions, export_functions, types),
-        host_linker: render_host_linker(import_functions, export_functions, types),
-        manifest: render_manifest(import_functions, export_functions),
+        guest_source: render_guest_source(&imports, &exports, types),
+        host_linker: render_host_linker(&imports, &exports, types),
+        manifest: render_manifest(&imports, &exports, types),
     })
 }
 
-fn validate_functions(
-    functions: &FunctionList,
+struct LoweredArgument<'a> {
+    name: &'a str,
+    ty: LoweredType<'a>,
+}
+
+struct LoweredFunction<'a> {
+    name: &'a str,
+    is_async: bool,
+    args: Vec<LoweredArgument<'a>>,
+    return_type: Option<LoweredType<'a>>,
+}
+
+fn lower_functions<'a>(
+    functions: &'a FunctionList,
+    types: &TypeMap,
     direction: &'static str,
     allow_async: bool,
-) -> Result<(), WasmtimeCoreWasmError> {
+) -> Result<Vec<LoweredFunction<'a>>, WasmtimeCoreWasmError> {
+    let mut lowered = Vec::new();
     for function in functions {
         if function.is_async && !allow_async {
             return Err(WasmtimeCoreWasmError::AsyncFunction {
@@ -97,19 +111,36 @@ fn validate_functions(
                 function: function.name.clone(),
             });
         }
-        for argument in &function.args {
-            lower_value_type(
-                &argument.ty,
-                direction,
-                &function.name,
-                format!("argument `{}`", argument.name),
-            )?;
-        }
-        if let Some(return_type) = &function.return_type {
-            lower_return_type(return_type, direction, &function.name)?;
-        }
+        let args = function
+            .args
+            .iter()
+            .map(|argument| {
+                Ok(LoweredArgument {
+                    name: &argument.name,
+                    ty: lower_value_type(
+                        &argument.ty,
+                        types,
+                        direction,
+                        &function.name,
+                        format!("argument `{}`", argument.name),
+                    )?,
+                })
+            })
+            .collect::<Result<_, WasmtimeCoreWasmError>>()?;
+        let return_type = function
+            .return_type
+            .as_ref()
+            .map(|ty| lower_return_type(ty, types, direction, &function.name))
+            .transpose()?
+            .flatten();
+        lowered.push(LoweredFunction {
+            name: &function.name,
+            is_async: function.is_async,
+            args,
+            return_type,
+        });
     }
-    Ok(())
+    Ok(lowered)
 }
 
 fn validate_type_definitions(types: &TypeMap) -> Result<(), WasmtimeCoreWasmError> {
@@ -140,29 +171,38 @@ fn validate_type_definitions(types: &TypeMap) -> Result<(), WasmtimeCoreWasmErro
     Ok(())
 }
 
-fn lower_value_type(
-    ty: &TypeIdent,
+fn lower_value_type<'a>(
+    ty: &'a TypeIdent,
+    types: &TypeMap,
     direction: &'static str,
     function: &str,
     position: String,
-) -> Result<LoweredType, WasmtimeCoreWasmError> {
+) -> Result<LoweredType<'a>, WasmtimeCoreWasmError> {
     if ty.is_array() || !ty.generic_args.is_empty() || ty.name == "()" {
         return Err(unsupported_value(direction, function, position, ty));
+    }
+    if matches!(types.get(ty), Some(Type::Resource(_))) {
+        return Ok(LoweredType {
+            semantic: &ty.name,
+            abi: "i64",
+            resource: true,
+        });
     }
     ty.as_primitive()
         .and_then(lower_primitive)
         .ok_or_else(|| unsupported_value(direction, function, position, ty))
 }
 
-fn lower_return_type(
-    ty: &TypeIdent,
+fn lower_return_type<'a>(
+    ty: &'a TypeIdent,
+    types: &TypeMap,
     direction: &'static str,
     function: &str,
-) -> Result<Option<LoweredType>, WasmtimeCoreWasmError> {
+) -> Result<Option<LoweredType<'a>>, WasmtimeCoreWasmError> {
     if ty.name == "()" && !ty.is_array() && ty.generic_args.is_empty() {
         return Ok(None);
     }
-    lower_value_type(ty, direction, function, "return".to_owned()).map(Some)
+    lower_value_type(ty, types, direction, function, "return".to_owned()).map(Some)
 }
 
 fn unsupported_value(
@@ -180,73 +220,56 @@ fn unsupported_value(
 }
 
 #[derive(Clone, Copy)]
-struct LoweredType {
-    semantic: &'static str,
+struct LoweredType<'a> {
+    semantic: &'a str,
     abi: &'static str,
+    resource: bool,
 }
 
-fn lower_primitive(primitive: Primitive) -> Option<LoweredType> {
-    use Primitive::*;
-    Some(match primitive {
-        Bool => LoweredType {
-            semantic: "bool",
-            abi: "i32",
-        },
-        I8 => LoweredType {
-            semantic: "i8",
-            abi: "i32",
-        },
-        I16 => LoweredType {
-            semantic: "i16",
-            abi: "i32",
-        },
-        I32 => LoweredType {
-            semantic: "i32",
-            abi: "i32",
-        },
-        U8 => LoweredType {
-            semantic: "u8",
-            abi: "i32",
-        },
-        U16 => LoweredType {
-            semantic: "u16",
-            abi: "i32",
-        },
-        U32 => LoweredType {
-            semantic: "u32",
-            abi: "i32",
-        },
-        I64 => LoweredType {
-            semantic: "i64",
-            abi: "i64",
-        },
-        U64 => LoweredType {
-            semantic: "u64",
-            abi: "i64",
-        },
-        F32 => LoweredType {
-            semantic: "f32",
-            abi: "f32",
-        },
-        F64 => LoweredType {
-            semantic: "f64",
-            abi: "f64",
-        },
-    })
-}
-
-fn lower_value_type_unchecked(ty: &TypeIdent) -> LoweredType {
-    ty.as_primitive()
-        .and_then(lower_primitive)
-        .expect("Core Wasm declarations are validated before rendering")
-}
-
-fn lower_return_type_unchecked(ty: &TypeIdent) -> Option<LoweredType> {
-    if ty.name == "()" && !ty.is_array() && ty.generic_args.is_empty() {
-        None
-    } else {
-        Some(lower_value_type_unchecked(ty))
+impl LoweredType<'_> {
+    fn rust_type(self) -> String {
+        if self.resource {
+            format!("resources::{}", self.semantic)
+        } else {
+            self.semantic.to_owned()
+        }
     }
+
+    fn manifest(self) -> String {
+        if self.resource {
+            format!(
+                "{{ semantic = \"{}\", abi = \"i64\", kind = \"resource\" }}",
+                self.semantic
+            )
+        } else {
+            format!(
+                "{{ semantic = \"{}\", abi = \"{}\" }}",
+                self.semantic, self.abi
+            )
+        }
+    }
+}
+
+fn lower_primitive(primitive: Primitive) -> Option<LoweredType<'static>> {
+    use Primitive::*;
+    let (semantic, abi) = match primitive {
+        Bool => ("bool", "i32"),
+        I8 => ("i8", "i32"),
+        I16 => ("i16", "i32"),
+        I32 => ("i32", "i32"),
+        U8 => ("u8", "i32"),
+        U16 => ("u16", "i32"),
+        U32 => ("u32", "i32"),
+        I64 => ("i64", "i64"),
+        U64 => ("u64", "i64"),
+        F32 => ("f32", "f32"),
+        F64 => ("f64", "f64"),
+    };
+    Some(LoweredType {
+        semantic,
+        abi,
+        resource: false,
+    })
 }
 
 fn render_guest_cargo() -> String {
@@ -261,8 +284,8 @@ fn render_guest_cargo() -> String {
 }
 
 fn render_guest_source(
-    import_functions: &FunctionList,
-    export_functions: &FunctionList,
+    import_functions: &[LoweredFunction<'_>],
+    export_functions: &[LoweredFunction<'_>],
     types: &TypeMap,
 ) -> String {
     let has_async_imports = import_functions.iter().any(|function| function.is_async);
@@ -292,11 +315,15 @@ fn render_guest_source(
     let operation_support = has_async_imports
         .then(render_guest_operation_support)
         .unwrap_or_default();
-    let import_uses = if has_async_imports {
+    let mut import_uses = if has_async_imports {
         "raw_imports, AbiError, PendingOperation"
     } else {
         "raw_imports, AbiError"
-    };
+    }
+    .to_owned();
+    if types.values().any(|ty| matches!(ty, Type::Resource(_))) {
+        import_uses.push_str(", resources");
+    }
     let operation_error_variants = if has_async_imports {
         "            InvalidOperationState(i32),\n            OperationCancelled,\n"
     } else {
@@ -304,8 +331,8 @@ fn render_guest_source(
     };
     let resources = render_guest_resource_types(types);
     format!(
-        "// Generated scalar Core Wasm guest bindings for `{ABI_NAMESPACE}`.\n\
-         // The public API uses semantic Rust scalar types; raw ABI values stay private.\n\n\
+        "// Generated Core Wasm guest bindings for `{ABI_NAMESPACE}`.\n\
+         // Public APIs use semantic scalar and resource types; raw ABI values stay private.\n\n\
          use std::sync::OnceLock;\n\n\
          #[derive(Clone, Debug, Eq, PartialEq)]\n\
          pub enum AbiError {{\n\
@@ -368,7 +395,7 @@ fn render_guest_resource_types(types: &TypeMap) -> String {
         .values()
         .filter_map(|ty| match ty {
             Type::Resource(resource) => Some(format!(
-                "#[repr(transparent)]\n#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]\npub struct {}(u64);\n\nimpl {} {{\n    pub(crate) fn from_abi(raw: u64) -> Self {{ Self(raw) }}\n    pub(crate) fn into_abi(self) -> u64 {{ self.0 }}\n}}\n\n",
+                "#[repr(transparent)]\n#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]\npub struct {}(u64);\n\nimpl {} {{\n    pub(crate) fn from_abi(raw: u64) -> Self {{ Self(raw) }}\n    pub(crate) fn into_abi(self) -> u64 {{ self.0 }}\n    pub(crate) fn decode_i64(raw: i64) -> ::std::result::Result<Self, super::AbiError> {{ ::std::result::Result::Ok(Self::from_abi(raw as u64)) }}\n    pub(crate) fn encode_i64(self) -> i64 {{ self.into_abi() as i64 }}\n}}\n\n",
                 resource.ident, resource.ident
             )),
             _ => None,
@@ -382,7 +409,7 @@ fn render_guest_resource_types(types: &TypeMap) -> String {
     }
 }
 
-fn render_guest_raw_import(function: &Function) -> String {
+fn render_guest_raw_import(function: &LoweredFunction<'_>) -> String {
     format!(
         "        #[link_name = \"{}\"]\n        pub(super) fn {}({}){};",
         function.name,
@@ -396,16 +423,11 @@ fn render_guest_raw_import(function: &Function) -> String {
     )
 }
 
-fn render_guest_typed_import(function: &Function) -> String {
+fn render_guest_typed_import(function: &LoweredFunction<'_>) -> String {
     let call_arguments = function
         .args
         .iter()
-        .map(|argument| {
-            format!(
-                "super::{}",
-                encode_expression(&argument.name, lower_value_type_unchecked(&argument.ty))
-            )
-        })
+        .map(|argument| format!("super::{}", encode_expression(argument.name, argument.ty)))
         .collect::<Vec<_>>()
         .join(", ");
     let call = format!(
@@ -421,11 +443,7 @@ fn render_guest_typed_import(function: &Function) -> String {
             render_operation_result_decoder(function),
         );
     }
-    let body = match function
-        .return_type
-        .as_ref()
-        .and_then(lower_return_type_unchecked)
-    {
+    let body = match function.return_type {
         Some(lowered) => format!(
             "let raw = {call};\n        {}",
             format!("super::{}", decode_expression("raw", lowered))
@@ -450,11 +468,11 @@ fn render_guest_operation_support() -> String {
         .to_owned()
 }
 
-fn render_guest_export_field(function: &Function) -> String {
+fn render_guest_export_field(function: &LoweredFunction<'_>) -> String {
     let arguments = function
         .args
         .iter()
-        .map(|argument| lower_value_type_unchecked(&argument.ty).semantic)
+        .map(|argument| argument.ty.rust_type())
         .collect::<Vec<_>>()
         .join(", ");
     format!(
@@ -464,7 +482,7 @@ fn render_guest_export_field(function: &Function) -> String {
     )
 }
 
-fn render_guest_export_wrapper(function: &Function) -> String {
+fn render_guest_export_wrapper(function: &LoweredFunction<'_>) -> String {
     let decoded = function
         .args
         .iter()
@@ -472,7 +490,7 @@ fn render_guest_export_wrapper(function: &Function) -> String {
             format!(
                 "let {} = require_abi({});",
                 argument.name,
-                decode_expression(&argument.name, lower_value_type_unchecked(&argument.ty))
+                decode_expression(argument.name, argument.ty)
             )
         })
         .collect::<Vec<_>>()
@@ -480,13 +498,11 @@ fn render_guest_export_wrapper(function: &Function) -> String {
     let names = function
         .args
         .iter()
-        .map(|argument| argument.name.as_str())
+        .map(|argument| argument.name)
         .collect::<Vec<_>>()
         .join(", ");
     let result = function
         .return_type
-        .as_ref()
-        .and_then(lower_return_type_unchecked)
         .map(|lowered| format!("{}(result)", encode_function(lowered)))
         .unwrap_or_default();
     format!(
@@ -499,8 +515,8 @@ fn render_guest_export_wrapper(function: &Function) -> String {
 }
 
 fn render_host_linker(
-    import_functions: &FunctionList,
-    export_functions: &FunctionList,
+    import_functions: &[LoweredFunction<'_>],
+    export_functions: &[LoweredFunction<'_>],
     types: &TypeMap,
 ) -> String {
     let has_async_imports = import_functions.iter().any(|function| function.is_async);
@@ -528,8 +544,8 @@ fn render_host_linker(
         .join("\n\n");
     let resources = render_host_resource_types(types);
     format!(
-        "// Generated private Wasmtime 45 glue for scalar Core Wasm ABI `{ABI_NAMESPACE}`.\n\
-         // Host trait and invocation helpers use semantic Rust scalar types.\n\n\
+        "// Generated private Wasmtime 45 glue for Core Wasm ABI `{ABI_NAMESPACE}`.\n\
+         // Host trait and invocation helpers use semantic scalar and resource types.\n\n\
          {resources}\
          {helpers}\n\n\
          pub(crate) trait KernalApiV1Imports {{\n{trait_methods}\n{operation_trait_methods}}}\n\n\
@@ -546,8 +562,8 @@ fn render_host_resource_types(types: &TypeMap) -> String {
         .values()
         .filter_map(|ty| match ty {
             Type::Resource(resource) => Some(format!(
-                "#[repr(transparent)]\n#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]\npub(crate) struct {}(pub(crate) u64);\n\n",
-                resource.ident
+                "#[repr(transparent)]\n#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]\npub(crate) struct {}(pub(crate) u64);\n\nimpl {} {{\n    pub(crate) fn decode_i64(raw: i64) -> ::wasmtime::Result<Self> {{ ::std::result::Result::Ok(Self(raw as u64)) }}\n    pub(crate) fn encode_i64(self) -> i64 {{ self.0 as i64 }}\n}}\n\n",
+                resource.ident, resource.ident
             )),
             _ => None,
         })
@@ -567,18 +583,29 @@ fn indent(source: &str, spaces: usize) -> String {
     let prefix = " ".repeat(spaces);
     source
         .lines()
-        .map(|line| format!("{prefix}{line}\n"))
+        .map(|line| {
+            if line.is_empty() {
+                "\n".to_owned()
+            } else {
+                format!("{prefix}{line}\n")
+            }
+        })
         .collect()
 }
 
-fn render_host_helpers(import_functions: &FunctionList, export_functions: &FunctionList) -> String {
+fn render_host_helpers(
+    import_functions: &[LoweredFunction<'_>],
+    export_functions: &[LoweredFunction<'_>],
+) -> String {
     let mut used = BTreeSet::new();
     for function in import_functions.iter().chain(export_functions.iter()) {
         for argument in &function.args {
-            used.insert(lower_value_type_unchecked(&argument.ty).semantic);
+            if !argument.ty.resource {
+                used.insert(argument.ty.semantic);
+            }
         }
-        if let Some(return_type) = &function.return_type {
-            if let Some(lowered) = lower_return_type_unchecked(return_type) {
+        if let Some(lowered) = function.return_type {
+            if !lowered.resource {
                 used.insert(lowered.semantic);
             }
         }
@@ -613,7 +640,7 @@ fn host_helper_source(semantic: &str) -> &'static str {
     }
 }
 
-fn render_host_trait_method(function: &Function) -> String {
+fn render_host_trait_method(function: &LoweredFunction<'_>) -> String {
     let arguments = render_semantic_arguments(function);
     let arguments = if arguments.is_empty() {
         String::new()
@@ -624,7 +651,7 @@ fn render_host_trait_method(function: &Function) -> String {
         "    fn {}(&mut self{arguments}) -> wasmtime::Result<{}>;",
         function.name,
         if function.is_async {
-            "u64"
+            "u64".to_owned()
         } else {
             semantic_return(function)
         }
@@ -636,7 +663,7 @@ fn render_host_operation_trait_methods() -> String {
         .to_owned()
 }
 
-fn render_host_registration(function: &Function) -> String {
+fn render_host_registration(function: &LoweredFunction<'_>) -> String {
     let decoded = function
         .args
         .iter()
@@ -644,7 +671,7 @@ fn render_host_registration(function: &Function) -> String {
             format!(
                 "let {} = {}?;",
                 argument.name,
-                decode_expression(&argument.name, lower_value_type_unchecked(&argument.ty))
+                decode_expression(argument.name, argument.ty)
             )
         })
         .collect::<Vec<_>>()
@@ -657,17 +684,13 @@ fn render_host_registration(function: &Function) -> String {
     let names = function
         .args
         .iter()
-        .map(|argument| argument.name.as_str())
+        .map(|argument| argument.name)
         .collect::<Vec<_>>()
         .join(", ");
     let result = if function.is_async {
         format!("Ok(caller.data_mut().{}({names})? as i64)", function.name)
     } else {
-        match function
-            .return_type
-            .as_ref()
-            .and_then(lower_return_type_unchecked)
-        {
+        match function.return_type {
             Some(lowered) => format!(
                 "Ok({}(caller.data_mut().{}({names})?))",
                 encode_function(lowered),
@@ -711,13 +734,9 @@ fn render_host_operation_registrations() -> String {
     )
 }
 
-fn render_host_invocation(function: &Function) -> String {
+fn render_host_invocation(function: &LoweredFunction<'_>) -> String {
     let call_arguments = render_wasm_call_params(function);
-    let result = match function
-        .return_type
-        .as_ref()
-        .and_then(lower_return_type_unchecked)
-    {
+    let result = match function.return_type {
         Some(lowered) => decode_expression("raw", lowered),
         None => "Ok(())".to_owned(),
     };
@@ -737,7 +756,21 @@ fn render_host_invocation(function: &Function) -> String {
     )
 }
 
-fn render_manifest(import_functions: &FunctionList, export_functions: &FunctionList) -> String {
+fn render_manifest(
+    import_functions: &[LoweredFunction<'_>],
+    export_functions: &[LoweredFunction<'_>],
+    types: &TypeMap,
+) -> String {
+    let resources = types
+        .values()
+        .filter_map(|ty| match ty {
+            Type::Resource(resource) => Some(format!(
+                "[[resources]]\nname = \"{}\"\nkind = \"opaque_host_handle\"\nabi = \"i64\"\n\n",
+                resource.ident
+            )),
+            _ => None,
+        })
+        .collect::<String>();
     let imports = import_functions
         .iter()
         .map(|function| render_manifest_record("imports", "guest-to-host", function))
@@ -754,7 +787,7 @@ fn render_manifest(import_functions: &FunctionList, export_functions: &FunctionL
         "\n".to_owned()
     };
     format!(
-        "schema = \"{SCHEMA}\"\nschema_revision = {SCHEMA_REVISION}\ngenerator_revision = {GENERATOR_REVISION}\nabi_version = {ABI_VERSION}\nnamespace = \"{ABI_NAMESPACE}\"\n\n{imports}{operation_controls}{exports}"
+        "schema = \"{SCHEMA}\"\nschema_revision = {SCHEMA_REVISION}\ngenerator_revision = {GENERATOR_REVISION}\nabi_version = {ABI_VERSION}\nnamespace = \"{ABI_NAMESPACE}\"\n\n{resources}{imports}{operation_controls}{exports}"
     )
 }
 
@@ -778,17 +811,11 @@ fn render_operation_control_manifest_records() -> String {
     .collect()
 }
 
-fn render_manifest_record(table: &str, direction: &str, function: &Function) -> String {
+fn render_manifest_record(table: &str, direction: &str, function: &LoweredFunction<'_>) -> String {
     let params = function
         .args
         .iter()
-        .map(|argument| {
-            let lowered = lower_value_type_unchecked(&argument.ty);
-            format!(
-                "{{ semantic = \"{}\", abi = \"{}\" }}",
-                lowered.semantic, lowered.abi
-            )
-        })
+        .map(|argument| argument.ty.manifest())
         .collect::<Vec<_>>()
         .join(", ");
     let results = if function.is_async {
@@ -796,27 +823,13 @@ fn render_manifest_record(table: &str, direction: &str, function: &Function) -> 
     } else {
         function
             .return_type
-            .as_ref()
-            .and_then(lower_return_type_unchecked)
-            .map(|lowered| {
-                format!(
-                    "{{ semantic = \"{}\", abi = \"{}\" }}",
-                    lowered.semantic, lowered.abi
-                )
-            })
+            .map(LoweredType::manifest)
             .unwrap_or_else(|| "{ semantic = \"()\", abi = \"unit\" }".to_owned())
     };
     let operation = if function.is_async {
         let result = function
             .return_type
-            .as_ref()
-            .and_then(lower_return_type_unchecked)
-            .map(|lowered| {
-                format!(
-                    "{{ semantic = \"{}\", abi = \"{}\" }}",
-                    lowered.semantic, lowered.abi
-                )
-            })
+            .map(LoweredType::manifest)
             .unwrap_or_else(|| "{ semantic = \"()\", abi = \"unit\" }".to_owned());
         format!("async = true\noperation_result = {result}\n")
     } else {
@@ -828,12 +841,11 @@ fn render_manifest_record(table: &str, direction: &str, function: &Function) -> 
     )
 }
 
-fn render_operation_result_decoder(function: &Function) -> String {
-    match function
-        .return_type
-        .as_ref()
-        .and_then(lower_return_type_unchecked)
-    {
+fn render_operation_result_decoder(function: &LoweredFunction<'_>) -> String {
+    match function.return_type {
+        Some(lowered) if lowered.resource => {
+            format!("|raw| super::{}", decode_expression("raw", lowered))
+        }
         Some(lowered) => match lowered.semantic {
             "bool" => "|raw| super::bool_from_i32(raw as i32)".to_owned(),
             "i8" => "|raw| super::i8_from_i32(raw as i32)".to_owned(),
@@ -852,49 +864,37 @@ fn render_operation_result_decoder(function: &Function) -> String {
     }
 }
 
-fn raw_import_name(function: &Function) -> String {
+fn raw_import_name(function: &LoweredFunction<'_>) -> String {
     format!("__kernal_api_v1_import_{}", function.name)
 }
 
-fn render_semantic_arguments(function: &Function) -> String {
+fn render_semantic_arguments(function: &LoweredFunction<'_>) -> String {
     function
         .args
         .iter()
-        .map(|argument| {
-            format!(
-                "{}: {}",
-                argument.name,
-                lower_value_type_unchecked(&argument.ty).semantic
-            )
-        })
+        .map(|argument| format!("{}: {}", argument.name, argument.ty.rust_type()))
         .collect::<Vec<_>>()
         .join(", ")
 }
 
-fn render_abi_arguments(function: &Function) -> String {
+fn render_abi_arguments(function: &LoweredFunction<'_>) -> String {
     render_abi_arguments_only(function)
 }
 
-fn render_abi_arguments_only(function: &Function) -> String {
+fn render_abi_arguments_only(function: &LoweredFunction<'_>) -> String {
     function
         .args
         .iter()
-        .map(|argument| {
-            format!(
-                "{}: {}",
-                argument.name,
-                lower_value_type_unchecked(&argument.ty).abi
-            )
-        })
+        .map(|argument| format!("{}: {}", argument.name, argument.ty.abi))
         .collect::<Vec<_>>()
         .join(", ")
 }
 
-fn render_wasm_function_params(function: &Function) -> String {
+fn render_wasm_function_params(function: &LoweredFunction<'_>) -> String {
     let params = function
         .args
         .iter()
-        .map(|argument| lower_value_type_unchecked(&argument.ty).abi)
+        .map(|argument| argument.ty.abi)
         .collect::<Vec<_>>();
     match params.as_slice() {
         [] => "()".to_owned(),
@@ -903,11 +903,11 @@ fn render_wasm_function_params(function: &Function) -> String {
     }
 }
 
-fn render_wasm_call_params(function: &Function) -> String {
+fn render_wasm_call_params(function: &LoweredFunction<'_>) -> String {
     let params = function
         .args
         .iter()
-        .map(|argument| encode_expression(&argument.name, lower_value_type_unchecked(&argument.ty)))
+        .map(|argument| encode_expression(argument.name, argument.ty))
         .collect::<Vec<_>>();
     match params.as_slice() {
         [] => "()".to_owned(),
@@ -916,33 +916,32 @@ fn render_wasm_call_params(function: &Function) -> String {
     }
 }
 
-fn render_abi_result(function: &Function) -> String {
+fn render_abi_result(function: &LoweredFunction<'_>) -> String {
     format!(" -> {}", render_abi_result_only(function))
 }
 
-fn render_abi_result_only(function: &Function) -> &'static str {
+fn render_abi_result_only(function: &LoweredFunction<'_>) -> &'static str {
     function
         .return_type
-        .as_ref()
-        .and_then(lower_return_type_unchecked)
         .map(|lowered| lowered.abi)
         .unwrap_or("()")
 }
 
-fn semantic_return(function: &Function) -> &'static str {
+fn semantic_return(function: &LoweredFunction<'_>) -> String {
     function
         .return_type
-        .as_ref()
-        .and_then(lower_return_type_unchecked)
-        .map(|lowered| lowered.semantic)
-        .unwrap_or("()")
+        .map(LoweredType::rust_type)
+        .unwrap_or_else(|| "()".to_owned())
 }
 
-fn encode_expression(name: &str, lowered: LoweredType) -> String {
+fn encode_expression(name: &str, lowered: LoweredType<'_>) -> String {
     format!("{}({name})", encode_function(lowered))
 }
 
-fn encode_function(lowered: LoweredType) -> &'static str {
+fn encode_function(lowered: LoweredType<'_>) -> String {
+    if lowered.resource {
+        return format!("resources::{}::encode_i64", lowered.semantic);
+    }
     match lowered.semantic {
         "bool" => "bool_to_i32",
         "i8" => "i8_to_i32",
@@ -957,9 +956,13 @@ fn encode_function(lowered: LoweredType) -> &'static str {
         "f64" => "f64_to_f64",
         _ => unreachable!("closed lowering table"),
     }
+    .to_owned()
 }
 
-fn decode_expression(name: &str, lowered: LoweredType) -> String {
+fn decode_expression(name: &str, lowered: LoweredType<'_>) -> String {
+    if lowered.resource {
+        return format!("resources::{}::decode_i64({name})", lowered.semantic);
+    }
     let function = match lowered.semantic {
         "bool" => "bool_from_i32",
         "i8" => "i8_from_i32",
@@ -1033,7 +1036,173 @@ mod tests {
         assert!(rendered
             .host_linker
             .contains("pub(crate) struct Archive(pub(crate) u64);"));
-        assert!(!rendered.manifest.contains("Archive"));
+        let manifest: toml::Value = rendered.manifest.parse().unwrap();
+        assert_eq!(manifest["resources"][0]["name"].as_str(), Some("Archive"));
+        assert_eq!(
+            manifest["resources"][0]["kind"].as_str(),
+            Some("opaque_host_handle")
+        );
+        assert_eq!(manifest["resources"][0]["abi"].as_str(), Some("i64"));
+    }
+
+    fn resource_types() -> TypeMap {
+        ["Archive", "Entry"]
+            .into_iter()
+            .map(|name| {
+                (
+                    TypeIdent::from(name),
+                    Type::Resource(crate::types::Resource::new(name)),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn resources_lower_to_nominal_signatures_and_i64_in_both_directions() {
+        let mut imports = FunctionList::new();
+        imports.add_function("fn open_entry(archive: Archive, index: u32) -> Entry;");
+        let mut exports = FunctionList::new();
+        exports.add_function("fn visit_entry(entry: Entry) -> Archive;");
+        let rendered = render_bindings(&imports, &exports, &resource_types()).unwrap();
+        syn::parse_file(&rendered.guest_source).unwrap();
+        syn::parse_file(&rendered.host_linker).unwrap();
+        assert!(rendered.guest_source.contains("pub fn open_entry(archive: resources::Archive, index: u32) -> Result<resources::Entry, AbiError>"));
+        assert!(rendered
+            .guest_source
+            .contains("__kernal_api_v1_import_open_entry(archive: i64, index: i32) -> i64"));
+        assert!(rendered
+            .guest_source
+            .contains("pub visit_entry: fn(resources::Entry) -> resources::Archive"));
+        assert!(rendered
+            .guest_source
+            .contains("pub extern \"C\" fn visit_entry(entry: i64) -> i64"));
+        assert!(rendered
+            .guest_source
+            .contains("super::resources::Archive::encode_i64(archive)"));
+        assert!(rendered
+            .guest_source
+            .contains("super::resources::Entry::decode_i64(raw)"));
+        assert!(rendered.host_linker.contains("fn open_entry(&mut self, archive: resources::Archive, index: u32) -> wasmtime::Result<resources::Entry>"));
+        assert!(rendered
+            .host_linker
+            .contains("resources::Archive::decode_i64(archive)?"));
+        assert!(rendered.host_linker.contains(
+            "resources::Entry::encode_i64(caller.data_mut().open_entry(archive, index)?)"
+        ));
+        assert!(rendered.host_linker.contains("get_typed_func::<i64, i64>"));
+        let manifest: toml::Value = rendered.manifest.parse().unwrap();
+        for record in [&manifest["imports"][0], &manifest["exports"][0]] {
+            for field in ["params", "results"] {
+                assert_eq!(record[field][0]["kind"].as_str(), Some("resource"));
+                assert_eq!(record[field][0]["abi"].as_str(), Some("i64"));
+            }
+        }
+        assert_eq!(
+            manifest["imports"][0]["params"][0]["semantic"].as_str(),
+            Some("Archive")
+        );
+        assert_eq!(
+            manifest["imports"][0]["results"][0]["semantic"].as_str(),
+            Some("Entry")
+        );
+        assert_eq!(
+            manifest["exports"][0]["params"][0]["semantic"].as_str(),
+            Some("Entry")
+        );
+        assert_eq!(
+            manifest["exports"][0]["results"][0]["semantic"].as_str(),
+            Some("Archive")
+        );
+    }
+
+    #[test]
+    fn async_resource_import_preserves_typed_completion() {
+        let mut imports = FunctionList::new();
+        imports.add_function("async fn next_entry(archive: Archive) -> Entry;");
+        let rendered = render_bindings(&imports, &FunctionList::new(), &resource_types()).unwrap();
+        syn::parse_file(&rendered.guest_source).unwrap();
+        syn::parse_file(&rendered.host_linker).unwrap();
+        assert!(rendered.guest_source.contains("pub fn next_entry(archive: resources::Archive) -> Result<PendingOperation<resources::Entry>, AbiError>"));
+        assert!(rendered
+            .guest_source
+            .contains("|raw| super::resources::Entry::decode_i64(raw)"));
+        assert!(rendered.host_linker.contains(
+            "fn next_entry(&mut self, archive: resources::Archive) -> wasmtime::Result<u64>"
+        ));
+        let manifest: toml::Value = rendered.manifest.parse().unwrap();
+        assert_eq!(manifest["imports"][0]["async"].as_bool(), Some(true));
+        assert_eq!(
+            manifest["imports"][0]["results"][0]["semantic"].as_str(),
+            Some("operation")
+        );
+        assert_eq!(
+            manifest["imports"][0]["operation_result"]["semantic"].as_str(),
+            Some("Entry")
+        );
+        assert_eq!(
+            manifest["imports"][0]["operation_result"]["kind"].as_str(),
+            Some("resource")
+        );
+        assert_eq!(
+            manifest["imports"][0]["operation_result"]["abi"].as_str(),
+            Some("i64")
+        );
+    }
+
+    #[test]
+    fn resource_signatures_require_declarations_and_reject_value_containers() {
+        for declaration in [
+            "fn unknown(value: Undeclared);",
+            "fn unknown() -> Undeclared;",
+            "async fn unknown() -> Undeclared;",
+            "fn list(value: Vec<Archive>);",
+            "fn generic(value: Archive<u64>);",
+            "fn optional() -> Option<Archive>;",
+            "fn array(value: [Archive; 2]);",
+        ] {
+            let mut imports = FunctionList::new();
+            imports.add_function(declaration);
+            assert!(
+                matches!(
+                    render_bindings(&imports, &FunctionList::new(), &resource_types()),
+                    Err(WasmtimeCoreWasmError::UnsupportedValue { .. })
+                ),
+                "{declaration}"
+            );
+        }
+        let mut exports = FunctionList::new();
+        exports.add_function("async fn unsupported() -> Archive;");
+        assert!(matches!(
+            render_bindings(&FunctionList::new(), &exports, &resource_types()),
+            Err(WasmtimeCoreWasmError::AsyncFunction { .. })
+        ));
+    }
+
+    #[test]
+    fn zero_length_resource_array_signatures_fail_before_lowering() {
+        for declaration in [
+            "fn empty(value: [Archive; 0]);",
+            "fn empty() -> [Archive; 0];",
+            "async fn empty() -> [Archive; 0];",
+        ] {
+            assert!(
+                std::panic::catch_unwind(|| crate::functions::Function::new(declaration)).is_err(),
+                "{declaration}"
+            );
+        }
+    }
+
+    #[test]
+    fn wasmtime45_resource_fixture_is_exact_generated_host_golden() {
+        let mut imports = FunctionList::new();
+        imports.add_function("fn open_entry(archive: Archive) -> Entry;");
+        let mut exports = FunctionList::new();
+        exports.add_function("fn visit_archive(archive: Archive) -> Entry;");
+        let rendered = render_bindings(&imports, &exports, &resource_types()).unwrap();
+        assert_eq!(
+            rendered.host_linker,
+            include_str!("../../tests/fixtures/wasmtime45_resource_host.rs")
+        );
     }
 
     #[test]

@@ -105,6 +105,8 @@ impl FromStr for TypeIdent {
             let element = split[0].trim();
             let len = usize::from_str(split[1].trim())
                 .map_err(|_| format!("Invalid array length in: {string}"))?;
+            let len = NonZeroUsize::new(len)
+                .ok_or_else(|| format!("Zero-length arrays are not supported: {string}"))?;
 
             let primitive = Primitive::from_str(element)?;
             if primitive.js_array_name().is_none() {
@@ -113,7 +115,7 @@ impl FromStr for TypeIdent {
                 ));
             }
 
-            (element, NonZeroUsize::new(len))
+            (element, Some(len))
         } else {
             (string, None)
         };
@@ -189,12 +191,14 @@ impl TryFrom<&syn::Type> for TypeIdent {
                     _ => panic!(),
                 }
                 .unwrap();
+                let array_len = NonZeroUsize::new(array_len)
+                    .ok_or_else(|| "Zero-length arrays are not supported".to_owned())?;
                 let elem_ident = TypeIdent::try_from(elem.as_ref())?;
 
                 Ok(Self {
                     name: elem_ident.name,
                     generic_args: vec![],
-                    array: NonZeroUsize::new(array_len),
+                    array: Some(array_len),
                 })
             }
             syn::Type::Path(TypePath { path, qself }) if qself.is_none() => {
@@ -265,6 +269,22 @@ fn path_to_string(path: &syn::Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_length_arrays_cannot_alias_their_element_type() {
+        assert!(TypeIdent::from_str("[u64; 0]")
+            .unwrap_err()
+            .contains("Zero-length"));
+        for source in ["[u64; 0]", "[Archive; 0]", "Vec<[Archive; 0]>"] {
+            let ty = syn::parse_str::<syn::Type>(source).unwrap();
+            assert!(
+                TypeIdent::try_from(&ty)
+                    .unwrap_err()
+                    .contains("Zero-length"),
+                "{source}"
+            );
+        }
+    }
 
     #[test]
     fn type_ident_from_syn_type() {
