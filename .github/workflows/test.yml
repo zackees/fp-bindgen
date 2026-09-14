@@ -19,16 +19,16 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.77"
+          toolchain: "1.95"
           components: clippy, rustfmt
 
       - name: Cache multiple paths
         id: cache
-        uses: actions/cache@v2
+        uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry/index/
@@ -67,7 +67,7 @@ jobs:
 
       - name: Install Wasm target
         run: |
-          rustup target add wasm32-unknown-unknown wasm32-wasi
+          rustup target add wasm32-unknown-unknown wasm32-wasip1
 
       - name: Verify generated Core Wasm guest compiles
         run: >-
@@ -97,3 +97,36 @@ jobs:
           cargo test
           cargo test -F wasi
           popd
+
+  wasmtime-core-wasm-targets:
+    name: Core Wasm generator (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+          - x86_64-pc-windows-msvc
+          - aarch64-pc-windows-msvc
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95"
+          targets: ${{ matrix.target }}
+
+      - name: Compile the dependency-isolated Core Wasm generator
+        run: >-
+          cargo check -p fp-bindgen --no-default-features
+          --features wasmtime-core-wasm --target ${{ matrix.target }}
+
+      - name: Run native generated-linker lifecycle proof
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: >-
+          cargo test -p fp-bindgen --no-default-features
+          --features wasmtime45-integration --test wasmtime45_generated

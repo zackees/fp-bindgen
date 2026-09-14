@@ -18,7 +18,7 @@ const WASM_BYTES: &'static [u8] =
     include_bytes!("../../example-plugin/target/wasm32-unknown-unknown/debug/example_plugin.wasm");
 #[cfg(feature="wasi")]
 const WASM_BYTES: &'static [u8] =
-    include_bytes!("../../example-plugin/target/wasm32-wasi/debug/example_plugin.wasm");
+    include_bytes!("../../example-plugin/target/wasm32-wasip1/debug/example_plugin.wasm");
 
 
 #[test]
